@@ -1,0 +1,18 @@
+[Unit]
+Description=CricGiri Cricket Analytics API
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/cricgiri
+Environment=PATH=/opt/cricgiri/venv/bin
+EnvironmentFile=/opt/cricgiri/.env
+ExecStart=/opt/cricgiri/venv/bin/uvicorn api.main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/cricgiri/logs/api.log
+StandardError=append:/opt/cricgiri/logs/api.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+services:
+  cricgiri-api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../uploads:/app/uploads
+      - ../outputs:/app/outputs
+      - ../logs:/app/logs
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - BALL_MODEL_PATH=models/ball_best.pt
+      - STUMP_MODEL_PATH=models/stump_best.pt
+      - SAVE_ANNOTATED_VIDEO=true
+      - MAX_UPLOAD_MB=200
+      # - DEVICE=0
+      # - USE_HALF_PRECISION=true
+      # - API_KEY=your-secret-key
+    restart: unless-stopped

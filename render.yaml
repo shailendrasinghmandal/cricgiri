@@ -1,0 +1,27 @@
+# Render Blueprint — auto-deploy from GitHub
+# Dashboard: New > Blueprint > select repo
+services:
+  - type: web
+    name: cricgiri-analytics-api
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: BALL_MODEL_PATH
+        value: models/ball_best.pt
+      - key: STUMP_MODEL_PATH
+        value: models/stump_best.pt
+      - key: SAVE_ANNOTATED_VIDEO
+        value: "true"
+      - key: MAX_UPLOAD_MB
+        value: "200"
+      - key: MODEL_VERSION
+        value: ball_best_v1
+    disk:
+      name: cricgiri-data
+      mountPath: /app/uploads
+      sizeGB: 10

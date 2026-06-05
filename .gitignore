@@ -1,8 +1,29 @@
-venv/
-runs/
+# Python
 __pycache__/
-*.pt
-*.pth
 *.pyc
+venv/
+.env
+debug-*.log
+
+# Runtime data
+api_storage/
+uploads/
+logs/
+outputs/
+runs/
 dataset/
-output/
+should_output/
+videos/
+tmp/
+
+# Large / local only
+yolo*.pt
+yolov8*.pt
+*.ppk
+_ref_trajectory_repo/
+.cursor/
+.ultralytics/
+
+# Keep production models
+!models/ball_best.pt
+!models/stump_best.pt

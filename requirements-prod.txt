@@ -1,0 +1,4 @@
+# CricGiri production — install: pip install -r requirements-prod.txt
+-r requirements.txt
+-r requirements-api.txt
+gunicorn>=21.2.0

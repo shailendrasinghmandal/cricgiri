@@ -1,0 +1,26 @@
+# Production ball tracking defaults (override via CLI or PipelineConfig)
+detection:
+  ball_confidence: 0.15
+  inference_imgsz: 1280
+  enable_tta: true
+  enable_roi: true
+  dynamic_confidence: true
+
+tracking:
+  max_missing_frames: 10
+  byte_track_low_ratio: 0.55   # low pool = conf >= primary * ratio
+  enable_optical_flow: true
+  interpolation_method: cubic   # linear | cubic | spline
+
+smoothing:
+  savgol_window: 7
+  savgol_polyorder: 2
+  enable_physics_future: true
+
+performance:
+  async_frames: false
+  frame_skip: 0                 # 0 = process every frame
+
+debug:
+  trajectory_debug: false
+  export_csv: true

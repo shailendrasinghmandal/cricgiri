@@ -2,7 +2,7 @@
 # Dashboard: New > Blueprint > connect repo > use this file
 services:
   - type: web
-    name: cricgiri-analytics-api
+    name: cricgiri
     runtime: docker
     dockerfilePath: ./deploy/Dockerfile
     dockerContext: .

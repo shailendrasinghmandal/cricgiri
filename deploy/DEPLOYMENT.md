@@ -120,12 +120,12 @@ PUBLIC_BASE_URL=https://YOUR-SERVICE.onrender.com
 ### Step 4 — Deploy
 Render builds Docker image and gives permanent URL:
 ```
-https://cricgiri-analytics-api.onrender.com
+https://cricgiri.onrender.com
 ```
 
 ### Step 5 — Share with owner
 ```
-https://cricgiri-analytics-api.onrender.com/docs
+https://cricgiri.onrender.com/docs
 ```
 
 **Custom domain (optional):** Render dashboard → Settings → Custom Domain → `api.cricgiri.com`

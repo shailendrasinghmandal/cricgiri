@@ -6,7 +6,7 @@ The FastAPI analytics API is ready to deploy from this repo.
 
 | Step | Action |
 |------|--------|
-| 1 | Open **[Deploy to Render](https://render.com/deploy?repo=https://github.com/shailendrasinghmandal/cricket_project)** |
+| 1 | Open **[Deploy to Render](https://render.com/deploy?repo=https://github.com/shailendrasinghmandal/cricgiri)** |
 | 2 | Sign in with **GitHub** (same account: `shailendrasinghmandal`) |
 | 3 | Click **Deploy Blueprint** — uses root `render.yaml` |
 | 4 | Confirm **Free** plan (no payment) — or **Starter** ($7/mo) for always-on client demos |
@@ -16,9 +16,9 @@ The FastAPI analytics API is ready to deploy from this repo.
 
 **Permanent URLs after deploy:**
 
-- Health: `https://cricgiri-analytics-api.onrender.com/health`
-- Swagger UI: `https://cricgiri-analytics-api.onrender.com/docs`
-- Analyze: `POST https://cricgiri-analytics-api.onrender.com/analyze`
+- Health: `https://cricgiri.onrender.com/health`
+- Swagger UI: `https://cricgiri.onrender.com/docs`
+- Analyze: `POST https://cricgiri.onrender.com/analyze`
 
 Full guide: [`deploy/DEPLOYMENT.md`](deploy/DEPLOYMENT.md) · Client doc: [`docs/API_SHARE_DOCUMENT.md`](docs/API_SHARE_DOCUMENT.md)
 

@@ -2,7 +2,7 @@
 # Dashboard: New > Blueprint > select repo
 services:
   - type: web
-    name: cricgiri-analytics-api
+    name: cricgiri
     runtime: docker
     dockerfilePath: ./deploy/Dockerfile
     dockerContext: .
@@ -24,6 +24,6 @@ services:
       - key: PUBLIC_BASE_URL
         fromService:
           type: web
-          name: cricgiri-analytics-api
+          name: cricgiri
           property: host
     # Persistent disk requires paid plan — free tier uses ephemeral storage only

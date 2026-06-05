@@ -21,6 +21,11 @@ services:
         value: "200"
       - key: MODEL_VERSION
         value: ball_best_v1
+      - key: PUBLIC_BASE_URL
+        fromService:
+          type: web
+          name: cricgiri-analytics-api
+          property: host
     disk:
       name: cricgiri-data
       mountPath: /app/uploads

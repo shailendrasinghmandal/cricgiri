@@ -1,5 +1,27 @@
 # Cricket Ball Analytics System using YOLOv8 and Kalman Tracking
 
+## Production API (Render — permanent URL)
+
+The FastAPI analytics API is ready to deploy from this repo.
+
+| Step | Action |
+|------|--------|
+| 1 | Open **[Deploy to Render](https://render.com/deploy?repo=https://github.com/shailendrasinghmandal/cricket_project)** |
+| 2 | Sign in with **GitHub** (same account: `shailendrasinghmandal`) |
+| 3 | Click **Deploy Blueprint** — uses root `render.yaml` |
+| 4 | Choose **Starter plan** ($7/mo, always on — required for client demo) |
+| 5 | Wait ~15–20 min for Docker build (PyTorch + YOLO) |
+
+**Permanent URLs after deploy:**
+
+- Health: `https://cricgiri-analytics-api.onrender.com/health`
+- Swagger UI: `https://cricgiri-analytics-api.onrender.com/docs`
+- Analyze: `POST https://cricgiri-analytics-api.onrender.com/analyze`
+
+Full guide: [`deploy/DEPLOYMENT.md`](deploy/DEPLOYMENT.md) · Client doc: [`docs/API_SHARE_DOCUMENT.md`](docs/API_SHARE_DOCUMENT.md)
+
+---
+
 ## Overview
 
 This project is a Computer Vision based Cricket Ball Analytics System developed using Python, YOLOv8, OpenCV, and Kalman Filtering.

@@ -9,8 +9,10 @@ The FastAPI analytics API is ready to deploy from this repo.
 | 1 | Open **[Deploy to Render](https://render.com/deploy?repo=https://github.com/shailendrasinghmandal/cricket_project)** |
 | 2 | Sign in with **GitHub** (same account: `shailendrasinghmandal`) |
 | 3 | Click **Deploy Blueprint** — uses root `render.yaml` |
-| 4 | Choose **Starter plan** ($7/mo, always on — required for client demo) |
+| 4 | Confirm **Free** plan (no payment) — or **Starter** ($7/mo) for always-on client demos |
 | 5 | Wait ~15–20 min for Docker build (PyTorch + YOLO) |
+
+**Free plan caveats:** service sleeps after 15 min idle (~1 min wake-up); 512 MB RAM may be tight for YOLO; uploads are not persisted across restarts.
 
 **Permanent URLs after deploy:**
 

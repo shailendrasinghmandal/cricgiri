@@ -6,7 +6,7 @@ services:
     runtime: docker
     dockerfilePath: ./deploy/Dockerfile
     dockerContext: .
-    plan: starter
+    plan: free
     healthCheckPath: /health
     envVars:
       - key: PYTHONUNBUFFERED
@@ -26,7 +26,4 @@ services:
           type: web
           name: cricgiri-analytics-api
           property: host
-    disk:
-      name: cricgiri-data
-      mountPath: /app/uploads
-      sizeGB: 10
+    # Persistent disk requires paid plan — free tier uses ephemeral storage only

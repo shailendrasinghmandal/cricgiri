@@ -1,0 +1,39 @@
+# CricGiri Delivery Analytics API — cloud container (api/delivery_api.py)
+# CPU build (most always-on hosts have no GPU). Expect ~2–5 min per request on CPU;
+# for ~20s responses use a GPU host and a CUDA torch wheel instead.
+FROM python:3.11-slim-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 ffmpeg curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# --- Python deps (CPU torch to keep the image small and host-agnostic) ---
+COPY requirements-api.txt ./
+RUN pip install --no-cache-dir \
+        torch torchvision --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir \
+        ultralytics opencv-python-headless numpy scipy \
+        fastapi "uvicorn[standard]" python-multipart pydantic-settings
+
+# --- App code ---
+COPY . .
+RUN mkdir -p uploads outputs videos logs models
+
+# --- Model weights (NOT in git — too large for GitHub's 100MB limit) ---
+# The three weights are fetched at build time from URLs you supply as build args
+# (e.g. GitHub Release assets, or a private signed URL). See deploy/DELIVERY_DEPLOY.md.
+ARG BALL_FT_T4_URL=""
+ARG BALL_LEATHER_URL=""
+ARG STUMP_URL=""
+RUN if [ -n "$BALL_FT_T4_URL" ]; then curl -fSL "$BALL_FT_T4_URL"  -o models/ball_ft_t4.pt; fi \
+ && if [ -n "$BALL_LEATHER_URL" ]; then curl -fSL "$BALL_LEATHER_URL" -o models/ball_best_leather_new.pt; fi \
+ && if [ -n "$STUMP_URL" ]; then curl -fSL "$STUMP_URL" -o models/stump_best.pt; fi
+
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
+
+# Host injects $PORT. Single worker: the models are a GPU/CPU singleton and the app
+# serialises inference internally. Long keep-alive for slow CPU inference.
+CMD ["sh", "-c", "uvicorn api.delivery_api:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --timeout-keep-alive 300"]

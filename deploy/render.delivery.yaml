@@ -1,0 +1,28 @@
+# Render Blueprint for the Delivery Analytics API (api/delivery_api.py).
+# Dashboard: New > Blueprint > pick this repo > point it at deploy/render.delivery.yaml
+#
+# NOTE: Render has no GPU. On CPU this pipeline is correct but SLOW (~2–5 min/request)
+# and needs real RAM (>=2GB) to load torch + the two ball models. The free/512MB plan
+# WILL OOM — use the "standard" (2GB) plan or larger. For ~20s responses, deploy the
+# same Dockerfile.delivery to a GPU host with a CUDA torch wheel instead.
+services:
+  - type: web
+    name: cricgiri-delivery-api
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile.delivery
+    dockerContext: .
+    plan: standard          # 2 GB RAM — free/starter (512MB) will OOM loading the models
+    healthCheckPath: /health
+    dockerBuildArgs:
+      # Fill these with your uploaded model URLs (GitHub Release assets or signed URLs).
+      BALL_FT_T4_URL: ""
+      BALL_LEATHER_URL: ""
+      STUMP_URL: ""
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: MAX_UPLOAD_MB
+        value: "200"
+      # Set API_KEY to require an X-API-Key header (recommended for a public URL):
+      # - key: API_KEY
+      #   generateValue: true

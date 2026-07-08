@@ -27,3 +27,6 @@ _ref_trajectory_repo/
 # Keep production models
 !models/ball_best.pt
 !models/stump_best.pt
+
+# tunnel binary (downloaded, not committed)
+deploy/bin/

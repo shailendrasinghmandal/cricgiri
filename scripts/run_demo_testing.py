@@ -203,6 +203,148 @@ def analytics_for(stem, render_pts, fps, W, H, smodel, device, pitch_len=PITCH_L
     return out, clean, recovered, rb, Hm, ppx
 
 
+def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pts, an,
+                          removed, verdict, recovered, Hm, ppx, pitch_len, conf=CONF):
+    """Assemble ONE video's schema-compliant result dict (top-level + single delivery).
+    Shared by the batch demo (main) and the single-video API engine (analyze_video)."""
+    conf_mean = round(float(np.mean([p[3] for p in all_pts])), 3) if all_pts else 0.0
+    rbf = an["bounce"]; wb = an["world_bounce"]
+    bframe = int(rbf["frame"]) if rbf else (int(all_pts[-1][0]) if all_pts else 0)
+
+    # world-space trajectory: ground-plane projection via the pitch homography. Airborne
+    # points suffer parallax and map to non-physical world coords; keep only points inside
+    # the real pitch bounds (|x|<=3.5 m, -1<=y<=pitch+3 m). z=0 (reported on the plane).
+    world_traj = []
+    if Hm is not None:
+        for p in all_pts:
+            wx, wy = cs.to_world(Hm, p[1], p[2])
+            if abs(wx) <= 3.5 and -1.0 <= wy <= pitch_len + 3.0:
+                world_traj.append([round(float(wx), 2), round(float(wy), 2), 0.0])
+
+    # swing = systematic lateral bend of the PRE-bounce path in PIXEL space (robust; no
+    # airborne-parallax explosion), scaled to cm via the homography ppx. Indicative only.
+    swing_cm, swing_type = 0.0, "straight"
+    pre = [(int(p[0]), float(p[1])) for p in all_pts if int(p[0]) <= bframe]
+    if ppx and len(pre) >= 4:
+        fr = np.array([q[0] for q in pre], float); px = np.array([q[1] for q in pre], float)
+        cx2 = np.polyfit(fr, px, 2); cx1 = np.polyfit(fr, px, 1)
+        dev_px = float(np.max(np.abs(np.polyval(cx2, fr) - np.polyval(cx1, fr))))
+        swing_cm = round(min(25.0, dev_px / ppx * 100), 1)
+        swing_type = ("inswing" if cx2[0] > 0 else "outswing") if swing_cm >= 2.5 else "straight"
+
+    bounce_px = (dict(frame_index=int(rbf["frame"]), x_pixel=round(float(rbf["x"]), 1),
+                      y_pixel=round(float(rbf["y"]), 1)) if rbf else None)
+    bounce_world = (dict(x_m=wb["x_m"], y_m=wb["y_m"]) if wb else None)
+    bounce_point = (dict(x=wb["x_m"], y=wb["y_m"]) if wb else None)
+    heatmap = ([[wb["x_m"], wb["y_m"]]] if wb else [])
+
+    sp = an["speed"]; spd_kmph = sp.get("kmph")
+    speed_block = dict(kmph=spd_kmph, confidence=sp.get("confidence", 0.3),
+                       status=("estimated" if spd_kmph is not None else "unavailable"))
+    ln = an["line"]; lg = an["length"]
+    line_block = dict(label=ln.get("label"), confidence=ln.get("confidence", 0.0),
+                      reliability=ln.get("reliability", "indicative"))
+    length_block = dict(label=lg.get("label"), confidence=lg.get("confidence", 0.0),
+                        distance_from_batsman_m=lg.get("dist_from_batsman_m"))
+
+    physically_valid = (removed == 0)
+    cfs = [c for c in [line_block["confidence"], length_block["confidence"],
+                       (speed_block["confidence"] if spd_kmph is not None else None)] if c]
+    confidence_score = round((float(np.mean(cfs)) if cfs else 0.0) * (1.0 if physically_valid else 0.7), 2)
+    did = f"{id_label}_" + hashlib.md5(
+        f"{stem}:{all_pts[0][0]}-{all_pts[-1][0]}".encode()).hexdigest()[:6]
+
+    delivery = dict(
+        delivery_id=did,
+        frame_start=int(all_pts[0][0]), frame_end=int(all_pts[-1][0]),
+        track=dict(num_points=len(all_pts), average_confidence=conf_mean,
+                   physics_removed_points=removed, physics_verdict=verdict,
+                   post_bounce_recovered=bool(recovered)),
+        bounce=bounce_px, bounce_world=bounce_world, bounce_point=bounce_point,
+        world_trajectory=world_traj, ball_flight_position=world_traj,
+        line=line_block, length=length_block,
+        speed=speed_block, speed_kmph=spd_kmph,
+        swing_cm=swing_cm, swing_type=swing_type, swing_confidence=0.2,
+        swing_status="indicative_direction_only",
+        heatmap_points=heatmap,
+        physically_valid=physically_valid, confidence_score=confidence_score)
+    return dict(
+        source_video=source_name, fps=round(fps, 2), total_frames=total_frames,
+        total_deliveries=1, pipeline_version="offline_mapping+physics_gate+reconstruction",
+        detection_confidence=conf, deliveries=[delivery])
+
+
+def _no_track_result(source_name, fps, total_frames, reason, conf=CONF):
+    """Schema-shaped response when no valid delivery is found (0 deliveries)."""
+    return dict(
+        source_video=source_name, fps=round(fps or 0.0, 2), total_frames=int(total_frames or 0),
+        total_deliveries=0, pipeline_version="offline_mapping+physics_gate+reconstruction",
+        detection_confidence=conf, status="NO_TRACK", reason=reason, deliveries=[])
+
+
+# Lazily-loaded singletons so the API loads the models ONCE, not per request.
+_ENGINE = {"models": None, "smodel": None, "device": None}
+
+
+def load_engine():
+    """Load (once) the ball ensemble + stump model + device for the analysis engine."""
+    if _ENGINE["models"] is None:
+        import torch
+        from ultralytics import YOLO
+        _ENGINE["device"] = "0" if torch.cuda.is_available() else "cpu"
+        _ENGINE["models"] = [YOLO(str(ROOT / "models" / m))
+                             for m in ("ball_ft_t4.pt", "ball_best_leather_new.pt")]
+        _ENGINE["smodel"] = YOLO(str(cs.STUMP))
+    return _ENGINE["models"], _ENGINE["smodel"], _ENGINE["device"]
+
+
+def analyze_video(video_path, pitch_length=PITCH_LEN, conf=CONF, work_id=None, cleanup=True):
+    """Analyse ONE cricket-delivery video and return the schema-compliant result dict.
+
+    This is the single-video engine behind the HTTP API. It runs the exact proven demo
+    pipeline (low-conf ensemble detection -> offline motion-consistency mapping ->
+    physics-validity gate -> static-cluster guard -> homography analytics -> time-of-flight
+    speed) and assembles the same JSON as the batch demo. Production weights are read-only.
+    """
+    import uuid
+    models, smodel, device = load_engine()
+    stem = work_id or ("api_" + uuid.uuid4().hex[:10])
+    vsrc = Path(video_path)
+    vdst = ROOT / "videos" / f"{stem}.mp4"
+    vdst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(vsrc, vdst)
+    try:
+        cap = cv2.VideoCapture(str(vdst)); fps = cap.get(5) or 30.0
+        N = int(cap.get(7)); cap.release()
+        # offline mapping (own ensemble detection + motion-consistency RANSAC)
+        subprocess.run([str(PY), str(ROOT / "scripts/map_trajectory.py"), "--video",
+                        str(vdst), "--conf", str(conf)],
+                       capture_output=True, text=True, timeout=600)
+        pts = dr.read_points(stem)
+        if len(pts) < 4:
+            return _no_track_result(vsrc.name, fps, N, "too_few_points", conf)
+        render_pts = clean_for_render(pts)
+        _xy = np.array([(p[1], p[2]) for p in render_pts], float)
+        _spread = float(np.hypot(np.ptp(_xy[:, 0]), np.ptp(_xy[:, 1]))) if len(_xy) else 0.0
+        if _spread < 60.0:
+            return _no_track_result(vsrc.name, fps, N, "static_cluster", conf)
+        cap = cv2.VideoCapture(str(vdst)); W = int(cap.get(3)); H = int(cap.get(4)); cap.release()
+        mp_csv = ROOT / "outputs" / "mapped" / stem / "mapped_path.csv"
+        with open(mp_csv, "w", newline="") as fh:
+            w = csv.writer(fh); w.writerow(["frame", "x", "y", "conf"])
+            w.writerows([[int(p[0]), p[1], p[2], p[3]] for p in render_pts])
+        _, removed, verdict, _ = pg.physics_filter(render_pts)
+        an, clean, recovered, rb, Hm, ppx = analytics_for(stem, render_pts, fps, W, H, smodel, device, pitch_length)
+        all_pts = sorted({int(p[0]): p for p in (clean + recovered)}.values(), key=lambda p: p[0])
+        return build_delivery_result(vsrc.name, fps, N, "delivery", stem, all_pts, an,
+                                     removed, verdict, recovered, Hm, ppx, pitch_length, conf)
+    finally:
+        if cleanup:
+            vdst.unlink(missing_ok=True)
+            shutil.rmtree(ROOT / "outputs" / "mapped" / stem, ignore_errors=True)
+            shutil.rmtree(ROOT / "outputs" / "detections" / stem, ignore_errors=True)
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Best-quality demo output for testing/ clips.")
@@ -284,78 +426,12 @@ def main():
             manifest.append(dict(clip=f"clip{i:02d}", source=v.name, status=f"ERROR:{type(e).__name__}"))
             print(f"   ERROR on {stem}: {e}\n{traceback.format_exc()}", flush=True); continue
 
-        # ── assemble the SCHEMA-COMPLIANT delivery JSON ──────────────────────
+        # ── assemble the schema-compliant result (shared with the API engine) ──
         all_pts = sorted({int(p[0]): p for p in (clean + recovered)}.values(), key=lambda p: p[0])
         tp = [dict(frame_idx=int(p[0]), x=round(p[1], 1), y=round(p[2], 1), conf=round(p[3], 3)) for p in all_pts]
-        conf_mean = round(float(np.mean([p[3] for p in all_pts])), 3) if all_pts else 0.0
-
-        rbf = an["bounce"]; wb = an["world_bounce"]
-        bframe = int(rbf["frame"]) if rbf else (int(all_pts[-1][0]) if all_pts else 0)
-
-        # world-space trajectory: ground-plane projection via the pitch homography. The
-        # ball is ABOVE the plane, so airborne points suffer parallax and land at
-        # non-physical world coords; only points that fall inside the real pitch bounds
-        # (|x|<=3.5 m, 0<=y<=pitch+3 m) are geometrically trustworthy -> keep only those
-        # (z=0, reported on the pitch plane). This is why the arc reads clean near the bounce.
-        world_traj = []
-        if Hm is not None:
-            for p in all_pts:
-                wx, wy = cs.to_world(Hm, p[1], p[2])
-                if abs(wx) <= 3.5 and -1.0 <= wy <= pitch_len + 3.0:
-                    world_traj.append([round(float(wx), 2), round(float(wy), 2), 0.0])
-
-        # swing = systematic lateral bend of the PRE-bounce path, computed in PIXEL space
-        # (robust: no airborne-parallax explosion) then scaled to cm via the homography's
-        # pixels-per-metre. Lateral calibration is weak, so reported as indicative only.
-        swing_cm, swing_type = 0.0, "straight"
-        pre = [(int(p[0]), float(p[1])) for p in all_pts if int(p[0]) <= bframe]
-        if ppx and len(pre) >= 4:
-            fr = np.array([q[0] for q in pre], float); px = np.array([q[1] for q in pre], float)
-            cx2 = np.polyfit(fr, px, 2); cx1 = np.polyfit(fr, px, 1)
-            dev_px = float(np.max(np.abs(np.polyval(cx2, fr) - np.polyval(cx1, fr))))
-            swing_cm = round(min(25.0, dev_px / ppx * 100), 1)
-            swing_type = ("inswing" if cx2[0] > 0 else "outswing") if swing_cm >= 2.5 else "straight"
-
-        bounce_px = (dict(frame_index=int(rbf["frame"]), x_pixel=round(float(rbf["x"]), 1),
-                          y_pixel=round(float(rbf["y"]), 1)) if rbf else None)
-        bounce_world = (dict(x_m=wb["x_m"], y_m=wb["y_m"]) if wb else None)
-        bounce_point = (dict(x=wb["x_m"], y=wb["y_m"]) if wb else None)
-        heatmap = ([[wb["x_m"], wb["y_m"]]] if wb else [])
-
-        sp = an["speed"]; spd_kmph = sp.get("kmph")
-        speed_block = dict(kmph=spd_kmph, confidence=sp.get("confidence", 0.3),
-                           status=("estimated" if spd_kmph is not None else "unavailable"))
-        ln = an["line"]; lg = an["length"]
-        line_block = dict(label=ln.get("label"), confidence=ln.get("confidence", 0.0),
-                          reliability=ln.get("reliability", "indicative"))
-        length_block = dict(label=lg.get("label"), confidence=lg.get("confidence", 0.0),
-                            distance_from_batsman_m=lg.get("dist_from_batsman_m"))
-
-        physically_valid = (removed == 0)
-        cfs = [c for c in [line_block["confidence"], length_block["confidence"],
-                           (speed_block["confidence"] if spd_kmph is not None else None)] if c]
-        confidence_score = round((float(np.mean(cfs)) if cfs else 0.0) * (1.0 if physically_valid else 0.7), 2)
-        did = f"clip{i:02d}_" + hashlib.md5(
-            f"{stem}:{all_pts[0][0]}-{all_pts[-1][0]}".encode()).hexdigest()[:6]
-
-        delivery = dict(
-            delivery_id=did,
-            frame_start=int(all_pts[0][0]), frame_end=int(all_pts[-1][0]),
-            track=dict(num_points=len(all_pts), average_confidence=conf_mean,
-                       physics_removed_points=removed, physics_verdict=verdict,
-                       post_bounce_recovered=bool(recovered)),
-            bounce=bounce_px, bounce_world=bounce_world, bounce_point=bounce_point,
-            world_trajectory=world_traj, ball_flight_position=world_traj,
-            line=line_block, length=length_block,
-            speed=speed_block, speed_kmph=spd_kmph,
-            swing_cm=swing_cm, swing_type=swing_type, swing_confidence=0.2,
-            swing_status="indicative_direction_only",
-            heatmap_points=heatmap,
-            physically_valid=physically_valid, confidence_score=confidence_score)
-        result = dict(
-            source_video=v.name, fps=round(fps, 2), total_frames=N, total_deliveries=1,
-            pipeline_version="offline_mapping+physics_gate+reconstruction",
-            detection_confidence=CONF, deliveries=[delivery])
+        result = build_delivery_result(v.name, fps, N, f"clip{i:02d}", stem, all_pts, an,
+                                       removed, verdict, recovered, Hm, ppx, pitch_len)
+        conf_mean = result["deliveries"][0]["track"]["average_confidence"]
         (cd / f"clip{i:02d}.json").write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
         with open(cd / f"clip{i:02d}.csv", "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=["frame_idx", "x", "y", "conf"]); w.writeheader(); w.writerows(tp)

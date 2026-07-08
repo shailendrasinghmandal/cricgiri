@@ -1,29 +1,31 @@
-# Render Blueprint — auto-deploy from GitHub
-# Dashboard: New > Blueprint > select repo
+# Render Blueprint — auto-deploy from GitHub.
+# Serves the Delivery Analytics API (api/delivery_api.py): POST /analyze -> delivery JSON.
+# Dashboard: New > Blueprint > select this repo (or push to the already-connected service).
+#
+# Free tier = CPU + ~512MB RAM, so it runs the SMALL committed model (ball_best.pt) at
+# imgsz 640. Correct, but slower and slightly less accurate than the local GPU config
+# (ball_ft_t4 + leather @ 1280). For full accuracy/speed use a paid GPU host + the big
+# weights (see deploy/DELIVERY_DEPLOY.md).
 services:
   - type: web
     name: cricgiri
     runtime: docker
-    dockerfilePath: ./deploy/Dockerfile
+    dockerfilePath: ./deploy/Dockerfile.delivery
     dockerContext: .
     plan: free
     healthCheckPath: /health
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
-      - key: BALL_MODEL_PATH
-        value: models/ball_best.pt
-      - key: STUMP_MODEL_PATH
-        value: models/stump_best.pt
-      - key: SAVE_ANNOTATED_VIDEO
-        value: "true"
+      # Free-tier engine config: committed small model, lighter image size.
+      - key: CRICGIRI_BALL_MODELS
+        value: ball_best.pt
+      - key: CRICGIRI_IMGSZ
+        value: "640"
+      - key: CRICGIRI_PITCH_LEN
+        value: "20.12"
       - key: MAX_UPLOAD_MB
-        value: "200"
-      - key: MODEL_VERSION
-        value: ball_best_v1
-      - key: PUBLIC_BASE_URL
-        fromService:
-          type: web
-          name: cricgiri
-          property: host
-    # Persistent disk requires paid plan — free tier uses ephemeral storage only
+        value: "80"
+      # Uncomment to require an X-API-Key header on the public URL:
+      # - key: API_KEY
+      #   generateValue: true

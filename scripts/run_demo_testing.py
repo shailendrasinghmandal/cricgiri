@@ -33,13 +33,22 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import os
+
 ROOT = Path(__file__).resolve().parents[1]
 PY = ROOT / "venv" / "Scripts" / "python.exe"
 SRC = ROOT / "testing"
 DST = ROOT / "testing_result_new"
-CONF = 0.05            # LOW conf for high recall (user-approved; FULLTRACK tracks these)
-IMGSZ = 1280
-PITCH_LEN = 20.12
+# Defaults = the validated local (GPU) config. On a small CPU cloud host, override via
+# env so the API fits free-tier RAM/CPU: CRICGIRI_IMGSZ=640 and CRICGIRI_BALL_MODELS=ball_best.pt.
+CONF = float(os.environ.get("CRICGIRI_CONF", "0.05"))   # LOW conf = high recall
+IMGSZ = int(os.environ.get("CRICGIRI_IMGSZ", "1280"))
+PITCH_LEN = float(os.environ.get("CRICGIRI_PITCH_LEN", "20.12"))
+# Ball detector ensemble (comma-separated names under models/). Missing files are skipped;
+# if none are present it falls back to the committed models/ball_best.pt so a cloud image
+# that only carries the small committed weights still runs.
+_BALL_MODELS_ENV = os.environ.get(
+    "CRICGIRI_BALL_MODELS", "ball_ft_t4.pt,ball_best_leather_new.pt")
 
 
 def _imp(n, p):
@@ -288,13 +297,22 @@ _ENGINE = {"models": None, "smodel": None, "device": None}
 
 
 def load_engine():
-    """Load (once) the ball ensemble + stump model + device for the analysis engine."""
+    """Load (once) the ball ensemble + stump model + device for the analysis engine.
+    Uses CRICGIRI_BALL_MODELS if the files exist, else falls back to the committed
+    models/ball_best.pt so a minimal cloud image still runs."""
     if _ENGINE["models"] is None:
         import torch
         from ultralytics import YOLO
         _ENGINE["device"] = "0" if torch.cuda.is_available() else "cpu"
-        _ENGINE["models"] = [YOLO(str(ROOT / "models" / m))
-                             for m in ("ball_ft_t4.pt", "ball_best_leather_new.pt")]
+        names = [m.strip() for m in _BALL_MODELS_ENV.split(",") if m.strip()]
+        paths = [ROOT / "models" / n for n in names if (ROOT / "models" / n).exists()]
+        if not paths:
+            fallback = ROOT / "models" / "ball_best.pt"
+            if fallback.exists():
+                paths = [fallback]
+        if not paths:
+            raise RuntimeError("no ball model weights found under models/")
+        _ENGINE["models"] = [YOLO(str(p)) for p in paths]
         _ENGINE["smodel"] = YOLO(str(cs.STUMP))
     return _ENGINE["models"], _ENGINE["smodel"], _ENGINE["device"]
 

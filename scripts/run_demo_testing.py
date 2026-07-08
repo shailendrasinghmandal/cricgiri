@@ -50,6 +50,7 @@ dr = _imp("dr", ROOT / "scripts" / "delivery_reconstruction.py")
 cs = _imp("cs", ROOT / "scripts" / "calibrated_speed.py")
 av2 = _imp("av2", ROOT / "scripts" / "analytics_v2.py")
 pg = _imp("pg", ROOT / "scripts" / "physics_gate_v2.py")
+mt = _imp("mt", ROOT / "scripts" / "map_trajectory.py")   # in-process mapping for the API
 
 import sys as _sys
 if str(ROOT) not in _sys.path:
@@ -314,12 +315,20 @@ def analyze_video(video_path, pitch_length=PITCH_LEN, conf=CONF, work_id=None, c
     vdst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(vsrc, vdst)
     try:
-        cap = cv2.VideoCapture(str(vdst)); fps = cap.get(5) or 30.0
-        N = int(cap.get(7)); cap.release()
-        # offline mapping (own ensemble detection + motion-consistency RANSAC)
-        subprocess.run([str(PY), str(ROOT / "scripts/map_trajectory.py"), "--video",
-                        str(vdst), "--conf", str(conf)],
-                       capture_output=True, text=True, timeout=600)
+        # IN-PROCESS offline mapping using the WARMED ensemble (no per-request subprocess
+        # model reload). detect_all returns W/H/frame-count/fps; ransac_trajectory picks the
+        # motion-consistent ball arc. Persist mapped_path.csv + detections.csv (same pass,
+        # so they can never mismatch) for read_points / analytics / recovery downstream.
+        dets, W, H, N, fps = mt.detect_all(models, str(vdst), conf, IMGSZ, device)
+        inliers, _px, _py, _t0, _span = mt.ransac_trajectory(dets, 34.0, W=W, H=H)
+        map_dir = ROOT / "outputs" / "mapped" / stem; map_dir.mkdir(parents=True, exist_ok=True)
+        with open(map_dir / "mapped_path.csv", "w", newline="") as fh:
+            w = csv.writer(fh); w.writerow(["frame", "x", "y", "conf"]); w.writerows(inliers)
+        det_dir = ROOT / "outputs" / "detections" / stem; det_dir.mkdir(parents=True, exist_ok=True)
+        with open(det_dir / "detections.csv", "w", newline="") as fh:
+            w = csv.writer(fh); w.writerow(["frame", "x", "y", "conf"])
+            w.writerows([[d[0], round(d[1], 1), round(d[2], 1), round(d[3], 3)] for d in dets])
+
         pts = dr.read_points(stem)
         if len(pts) < 4:
             return _no_track_result(vsrc.name, fps, N, "too_few_points", conf)
@@ -328,9 +337,7 @@ def analyze_video(video_path, pitch_length=PITCH_LEN, conf=CONF, work_id=None, c
         _spread = float(np.hypot(np.ptp(_xy[:, 0]), np.ptp(_xy[:, 1]))) if len(_xy) else 0.0
         if _spread < 60.0:
             return _no_track_result(vsrc.name, fps, N, "static_cluster", conf)
-        cap = cv2.VideoCapture(str(vdst)); W = int(cap.get(3)); H = int(cap.get(4)); cap.release()
-        mp_csv = ROOT / "outputs" / "mapped" / stem / "mapped_path.csv"
-        with open(mp_csv, "w", newline="") as fh:
+        with open(map_dir / "mapped_path.csv", "w", newline="") as fh:   # write back the cleaned arc
             w = csv.writer(fh); w.writerow(["frame", "x", "y", "conf"])
             w.writerows([[int(p[0]), p[1], p[2], p[3]] for p in render_pts])
         _, removed, verdict, _ = pg.physics_filter(render_pts)

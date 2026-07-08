@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -51,6 +52,11 @@ except Exception:
 
 logger = logging.getLogger("cricgiri.delivery_api")
 ALLOWED_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+# The ball/stump YOLO models are shared singletons and torch inference is NOT thread-safe;
+# run_in_threadpool would otherwise run requests concurrently on the same model. Serialise
+# analysis so one video is processed at a time (single GPU -> this is also the throughput cap).
+_INFER_LOCK = threading.Lock()
 
 app = FastAPI(
     title="CricGiri Delivery Analytics API",
@@ -121,10 +127,11 @@ async def analyze(
     t0 = time.perf_counter()
 
     def _run() -> dict:
-        # engine.analyze_video is heavy + not thread-safe on the GPU; the engine's
-        # own singletons + a unique work-id per call keep files from colliding, and
-        # run_in_threadpool keeps the event loop free. Single GPU -> effectively serial.
-        return engine.analyze_video(str(tmp), pitch_length=float(pitch_length))
+        # Heavy + GPU-bound. run_in_threadpool keeps the event loop free; _INFER_LOCK
+        # serialises the actual inference (shared, non-thread-safe models); the unique
+        # per-call work-id keeps each request's temp files isolated.
+        with _INFER_LOCK:
+            return engine.analyze_video(str(tmp), pitch_length=float(pitch_length))
 
     try:
         result = await run_in_threadpool(_run)

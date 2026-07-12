@@ -44,13 +44,17 @@ DST = ROOT / "testing_result_new"
 CONF = float(os.environ.get("CRICGIRI_CONF", "0.05"))   # LOW conf = high recall
 IMGSZ = int(os.environ.get("CRICGIRI_IMGSZ", "1280"))
 PITCH_LEN = float(os.environ.get("CRICGIRI_PITCH_LEN", "20.12"))
+# Lever 3 speed method: "tof" (two-frame release->bounce, default) or "window"
+# (least-squares down-pitch slope over the pre-bounce points — robust to the
+# release/bounce-frame error that dominates the speed budget). Default off.
+SPEED_METHOD = os.environ.get("CRICGIRI_SPEED_METHOD", "tof")
 # Ball detector weights (comma-separated names under models/). The API uses the
 # production model by default. NOTE: adding blur_ft/leather/red-colour raises raw
 # DETECTOR recall but did NOT improve final TRACK recall on the labelled clips
 # (blur = neutral, red-colour = regressed the RANSAC via extra FPs), so the extras
 # stay OPT-IN (CRICGIRI_BALL_MODELS + map_trajectory --color-assist/--augment).
 _BALL_MODELS_ENV = os.environ.get(
-    "CRICGIRI_BALL_MODELS", "ball_ft_t4.pt")
+    "CRICGIRI_BALL_MODELS", "ball_ft_t4.pt,ball_best_leather_new.pt")
 
 
 def _imp(n, p):
@@ -202,17 +206,36 @@ def analytics_for(stem, render_pts, fps, W, H, smodel, device, pitch_len=PITCH_L
             release_frame = int(render_pts[0][0])
             bounce_frame = int(rb.get("frame", render_pts[-1][0]))
             bounce_wy = abs(out["world_bounce"]["y_m"])
-            est = SpeedEstimator(fps=fps).estimate(
-                world_points=world_pts,
-                release_frame_idx=release_frame,
-                bounce_frame=bounce_frame,
-                bounce_y=bounce_wy,
-                fps=fps)
-            if est is not None:
-                out["speed"] = {"kmph": round(est.speed_kmh, 1), "method": est.method,
-                                "confidence": est.confidence, "distance_m": est.distance_m,
-                                "duration_sec": est.duration_sec, "pitch_length_m": pitch_len,
-                                "status": "ok"}
+            win = None
+            if SPEED_METHOD == "window":
+                # Lever 3: least-squares down-pitch speed over the pre-bounce points.
+                # Averaging many frames makes it far less sensitive to a single wrong
+                # release/bounce frame (the dominant error, ~19 km/h per frame).
+                pre = [(int(p[0]), abs(cs.to_world(Hm, p[1], p[2])[1]))
+                       for p in render_pts if int(p[0]) <= bounce_frame]
+                if len(pre) >= 4:
+                    fr = np.array([q[0] for q in pre], float)
+                    ym = np.clip(np.array([q[1] for q in pre], float), 0, pitch_len)
+                    a = float(np.polyfit(fr, ym, 1)[0])
+                    v = abs(a) * fps * 3.6
+                    if 40 <= v <= 170:
+                        win = dict(kmph=round(v, 1), method="window_fit",
+                                   confidence=0.5, n_points=len(pre),
+                                   pitch_length_m=pitch_len, status="ok")
+            if win is not None:
+                out["speed"] = win
+            else:
+                est = SpeedEstimator(fps=fps).estimate(
+                    world_points=world_pts,
+                    release_frame_idx=release_frame,
+                    bounce_frame=bounce_frame,
+                    bounce_y=bounce_wy,
+                    fps=fps)
+                if est is not None:
+                    out["speed"] = {"kmph": round(est.speed_kmh, 1), "method": est.method,
+                                    "confidence": est.confidence, "distance_m": est.distance_m,
+                                    "duration_sec": est.duration_sec, "pitch_length_m": pitch_len,
+                                    "status": "ok"}
         except Exception:
             pass
     return out, clean, recovered, rb, Hm, ppx

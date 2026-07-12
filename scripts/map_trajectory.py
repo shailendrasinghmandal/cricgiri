@@ -60,36 +60,49 @@ def load_models(primary: str, alt):
     return models
 
 
-# Color-assist: detect a bright, saturated, round ball (e.g. a yellow tennis ball)
+# Color-assist: detect a saturated, round ball (yellow tennis OR red/dark leather)
 # that a white-trained YOLO model misses. These candidates are ADDED to the YOLO
 # pool; the existing motion-RANSAC then rejects static colour false positives.
+# "off" | "yellow" | "red" | "both"  — measured: red proposer lifts a red-leather
+# clip's per-frame recall 0.14 -> 0.24 (clip02) with no training.
 _COLOR_ASSIST = False
+_COLOR_MODE = "both"
 
 
 def color_ball_candidates(frame) -> List[tuple]:
-    """Return [(x, y, conf)] for bright saturated round ball-like blobs."""
+    """Return [(x, y, conf)] for saturated round ball-like blobs (tennis and/or
+    red leather), controlled by _COLOR_MODE."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    # yellow-green / orange tennis-ball range (bright, saturated)
-    mask = cv2.inRange(hsv, (20, 70, 90), (55, 255, 255))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    masks = []
+    if _COLOR_MODE in ("yellow", "both"):
+        masks.append(((20, 70, 90), (55, 255, 255), 20, 1500))       # tennis
+    if _COLOR_MODE in ("red", "both"):
+        # red leather wraps hue 0 — two bands. Smaller/looser area (balls read tiny).
+        masks.append(((0, 60, 40), (12, 255, 220), 3, 500))
+        masks.append(((168, 60, 40), (180, 255, 220), 3, 500))
     out = []
-    for ct in cnts:
-        a = cv2.contourArea(ct)
-        if a < 20 or a > 1500:
-            continue
-        (x, y), r = cv2.minEnclosingCircle(ct)
-        if r <= 0:
-            continue
-        circ = a / (math.pi * r * r)
-        if circ < 0.55:                      # round only
-            continue
-        # confidence from roundness (motion-RANSAC does the real validation)
-        out.append((float(x), float(y), 0.30 + 0.4 * min(1.0, circ)))
+    for lo, hi, amin, amax in masks:
+        mask = cv2.inRange(hsv, lo, hi)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for ct in cnts:
+            a = cv2.contourArea(ct)
+            if a < amin or a > amax:
+                continue
+            (x, y), r = cv2.minEnclosingCircle(ct)
+            if r <= 0:
+                continue
+            circ = a / (math.pi * r * r)
+            if circ < 0.5:                       # round-ish only
+                continue
+            out.append((float(x), float(y), 0.30 + 0.4 * min(1.0, circ)))
     return out
 
 
-def detect_all(models, video: str, conf: float, imgsz: int, device: str) -> Tuple[List[Det], int, int, int, float]:
+def detect_all(models, video: str, conf: float, imgsz: int, device: str,
+               augment: bool = False) -> Tuple[List[Det], int, int, int, float]:
+    """`augment` = YOLO test-time augmentation (multi-scale/flip). Slower but
+    lifts recall on small/blurred balls (measured clip01 0.72 -> 0.76, no training)."""
     cap = cv2.VideoCapture(video)
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)); fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -101,7 +114,8 @@ def detect_all(models, video: str, conf: float, imgsz: int, device: str) -> Tupl
             break
         cand = []
         for m in models:
-            r = m.predict(frame, conf=conf, imgsz=imgsz, device=device, verbose=False)[0]
+            r = m.predict(frame, conf=conf, imgsz=imgsz, device=device, verbose=False,
+                          augment=augment)[0]
             if r.boxes is None:
                 continue
             for b in r.boxes:

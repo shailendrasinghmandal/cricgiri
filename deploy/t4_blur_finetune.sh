@@ -14,6 +14,19 @@
 set -e
 cd /home/ubuntu
 
+# Where ball_clean already lives (reuse the set from the ball_ft_t4 training if present,
+# so you don't re-upload). Override:  BALL_CLEAN=/path/to/ball_clean ./t4_blur_finetune.sh
+BALL_CLEAN="${BALL_CLEAN:-}"
+if [ -z "$BALL_CLEAN" ]; then
+  for c in ball_clean ~/ball_clean_extracted/ball_clean /home/ec2-user/ball_clean_extracted/ball_clean; do
+    [ -d "$c/images" ] && BALL_CLEAN="$c" && break
+  done
+fi
+if [ -z "$BALL_CLEAN" ] || [ ! -d "$BALL_CLEAN/images" ]; then
+  echo "ERROR: ball_clean not found. Upload it, or set BALL_CLEAN=/path/to/ball_clean"; exit 1
+fi
+echo "using source dataset: $BALL_CLEAN"
+
 echo "== 1/4  environment =="
 python3 -m pip install --upgrade pip -q
 python3 -m pip install -q ultralytics opencv-python-headless numpy
@@ -21,7 +34,7 @@ python3 -m pip install -q ultralytics opencv-python-headless numpy
 echo "== 2/4  build blur-augmented dataset from ball_clean =="
 if [ ! -f ball_blur_aug/data.yaml ]; then
   python3 build_blur_hard_dataset.py \
-    --src ball_clean --out ball_blur_aug \
+    --src "$BALL_CLEAN" --out ball_blur_aug \
     --variants 2 --motion-min 9 --motion-max 31 --keep-original
 fi
 echo "dataset:"; head -6 ball_blur_aug/data.yaml

@@ -439,11 +439,12 @@ def render(video: str, dets: List[Det], inliers: List[Det], segments, bounce_xy,
         cv2.imwrite(str(out_img), base)
 
 
-def process(video: str, models, conf: float, imgsz: int, device: str, inlier_px: float):
+def process(video: str, models, conf: float, imgsz: int, device: str, inlier_px: float,
+            augment: bool = False):
     name = Path(video).stem
     out_dir = ROOT / "outputs" / "mapped" / name
     out_dir.mkdir(parents=True, exist_ok=True)
-    dets, W, H, total, fps = detect_all(models, video, conf, imgsz, device)
+    dets, W, H, total, fps = detect_all(models, video, conf, imgsz, device, augment=augment)
     inliers, px, py, t0, span = ransac_trajectory(dets, inlier_px, W=W, H=H)
     segments, bounce_xy = segmented_fit(inliers)
     render(video, dets, inliers, segments, bounce_xy,
@@ -479,10 +480,14 @@ def main():
     ap.add_argument("--device", default="0")
     ap.add_argument("--inlier-px", type=float, default=34.0)
     ap.add_argument("--color-assist", action="store_true",
-                    help="also detect a bright saturated ball by colour (e.g. yellow tennis ball)")
+                    help="also detect a saturated ball by colour (yellow tennis / red leather)")
+    ap.add_argument("--color-mode", default="both", choices=["yellow", "red", "both"])
+    ap.add_argument("--augment", action="store_true",
+                    help="YOLO test-time augmentation (slower; higher small/blurred-ball recall)")
     args = ap.parse_args()
-    global _COLOR_ASSIST
+    global _COLOR_ASSIST, _COLOR_MODE
     _COLOR_ASSIST = bool(args.color_assist)
+    _COLOR_MODE = args.color_mode
 
     vids: List[str] = []
     if args.all:
@@ -496,7 +501,8 @@ def main():
     print(f"Mapping {len(vids)} clip(s) | conf={args.conf} inlier={args.inlier_px}px")
     for v in vids:
         try:
-            process(v, models, args.conf, args.imgsz, args.device, args.inlier_px)
+            process(v, models, args.conf, args.imgsz, args.device, args.inlier_px,
+                    augment=args.augment)
         except Exception as e:
             import traceback; print(f"  {Path(v).stem}: ERROR {e}"); traceback.print_exc()
 

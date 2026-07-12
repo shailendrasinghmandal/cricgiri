@@ -40,15 +40,17 @@ PY = ROOT / "venv" / "Scripts" / "python.exe"
 SRC = ROOT / "testing"
 DST = ROOT / "testing_result_new"
 # Defaults = the validated local (GPU) config. On a small CPU cloud host, override via
-# env so the API fits free-tier RAM/CPU: CRICGIRI_IMGSZ=640 and CRICGIRI_BALL_MODELS=ball_best.pt.
+# env so the API can trade accuracy for speed/RAM with CRICGIRI_IMGSZ.
 CONF = float(os.environ.get("CRICGIRI_CONF", "0.05"))   # LOW conf = high recall
 IMGSZ = int(os.environ.get("CRICGIRI_IMGSZ", "1280"))
 PITCH_LEN = float(os.environ.get("CRICGIRI_PITCH_LEN", "20.12"))
-# Ball detector ensemble (comma-separated names under models/). Missing files are skipped;
-# if none are present it falls back to the committed models/ball_best.pt so a cloud image
-# that only carries the small committed weights still runs.
+# Ball detector weights (comma-separated names under models/). The API uses the
+# production model by default. NOTE: adding blur_ft/leather/red-colour raises raw
+# DETECTOR recall but did NOT improve final TRACK recall on the labelled clips
+# (blur = neutral, red-colour = regressed the RANSAC via extra FPs), so the extras
+# stay OPT-IN (CRICGIRI_BALL_MODELS + map_trajectory --color-assist/--augment).
 _BALL_MODELS_ENV = os.environ.get(
-    "CRICGIRI_BALL_MODELS", "ball_ft_t4.pt,ball_best_leather_new.pt")
+    "CRICGIRI_BALL_MODELS", "ball_ft_t4.pt")
 
 
 def _imp(n, p):
@@ -60,6 +62,9 @@ cs = _imp("cs", ROOT / "scripts" / "calibrated_speed.py")
 av2 = _imp("av2", ROOT / "scripts" / "analytics_v2.py")
 pg = _imp("pg", ROOT / "scripts" / "physics_gate_v2.py")
 mt = _imp("mt", ROOT / "scripts" / "map_trajectory.py")   # in-process mapping for the API
+# Colour-assist is OPT-IN: it lifts raw detector recall but its extra red blobs are
+# false positives that regressed the final RANSAC track on the labelled clips.
+# (mt._COLOR_ASSIST stays False; enable per-run only if the track-builder is FP-hardened.)
 
 import sys as _sys
 if str(ROOT) not in _sys.path:
@@ -293,13 +298,12 @@ def _no_track_result(source_name, fps, total_frames, reason, conf=CONF):
 
 
 # Lazily-loaded singletons so the API loads the models ONCE, not per request.
-_ENGINE = {"models": None, "smodel": None, "device": None}
+_ENGINE = {"models": None, "smodel": None, "device": None, "model_paths": []}
 
 
 def load_engine():
     """Load (once) the ball ensemble + stump model + device for the analysis engine.
-    Uses CRICGIRI_BALL_MODELS if the files exist, else falls back to the committed
-    models/ball_best.pt so a minimal cloud image still runs."""
+    Uses CRICGIRI_BALL_MODELS if set, otherwise models/ball_ft_t4.pt."""
     if _ENGINE["models"] is None:
         import torch
         from ultralytics import YOLO
@@ -307,12 +311,13 @@ def load_engine():
         names = [m.strip() for m in _BALL_MODELS_ENV.split(",") if m.strip()]
         paths = [ROOT / "models" / n for n in names if (ROOT / "models" / n).exists()]
         if not paths:
-            fallback = ROOT / "models" / "ball_best.pt"
+            fallback = ROOT / "models" / "ball_ft_t4.pt"
             if fallback.exists():
                 paths = [fallback]
         if not paths:
             raise RuntimeError("no ball model weights found under models/")
         _ENGINE["models"] = [YOLO(str(p)) for p in paths]
+        _ENGINE["model_paths"] = [str(p) for p in paths]
         _ENGINE["smodel"] = YOLO(str(cs.STUMP))
     return _ENGINE["models"], _ENGINE["smodel"], _ENGINE["device"]
 
@@ -387,7 +392,7 @@ def main():
     from ultralytics import YOLO
     device = "0" if torch.cuda.is_available() else "cpu"
     print(f"device={device}  conf={CONF}  imgsz={IMGSZ}  pitch_len={pitch_len}m")
-    models = [YOLO(str(ROOT / "models" / m)) for m in ("ball_ft_t4.pt", "ball_best_leather_new.pt")]
+    models = [YOLO(str(ROOT / "models" / "ball_ft_t4.pt"))]
     smodel = YOLO(str(cs.STUMP))
 
     vids = sorted(SRC.glob("*.mp4"))

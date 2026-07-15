@@ -1119,13 +1119,15 @@ class CricketAnalyticsPipeline:
                             bounce_pixel = None
                             if active_del.bounce and render_frame_idx >= active_del.bounce["frame_idx"]:
                                 bounce_pixel = (active_del.bounce["pixel_x"], active_del.bounce["pixel_y"])
-                            swing_cm = ((active_del.swing["swing_cm"] / 100.0) * 100) if active_del.swing else 0.0
-                            drift_angle_deg = 0.0
-                            if active_del.swing and active_del.swing.get("swing_cm") and active_del.swing["swing_cm"] > 0:
-                                import math as _math
-                                drift_angle_deg = round(_math.degrees(_math.atan2(
-                                    active_del.swing["swing_cm"] / 100.0, 10.0
-                                )), 1)
+                            # Overlay MUST show the same numbers as the JSON response:
+                            # swing is a 0-1 factor (sf) and spin is factor*45 degrees.
+                            # (This panel previously printed centimetres under an "sf"
+                            # label and an unrelated atan2 drift angle.)
+                            swing_sf = (
+                                round(min(1.0, float(active_del.swing["swing_cm"]) / 25.0), 3)
+                                if active_del.swing else 0.0
+                            )
+                            drift_angle_deg = round(swing_sf * 45.0, 1)
                             dbg = path_dbg if self.cfg.trajectory_debug and path_dbg else None
                             vis = VisualFrame(
                                 trajectory_pixels=visible_path,
@@ -1142,7 +1144,7 @@ class CricketAnalyticsPipeline:
                                 speed_kmh=active_del.speed["speed_kmh"] if active_del.speed else 0.0,
                                 speed_mph=active_del.speed.get("speed_mph", 0.0) if active_del.speed else 0.0,
                                 speed_reliable=_speed_is_reliable(active_del.speed),
-                                swing_deg=swing_cm,
+                                swing_deg=swing_sf,
                                 spin_rpm=drift_angle_deg,
                                 swing_label=active_del.swing["direction"] if active_del.swing else "none",
                                 bounce_pixel=bounce_pixel,

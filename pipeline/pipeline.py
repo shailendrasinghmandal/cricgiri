@@ -117,6 +117,11 @@ def _speed_is_reliable(speed: Optional[dict]) -> bool:
         return False
 
 
+# Full pitch, stump-to-stump. Scales every world/down-pitch value in the response.
+PITCH_LENGTH_M_DEFAULT = 20.12
+_YARDS_PER_M = 1.0936133
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -142,6 +147,9 @@ class PipelineConfig:
     # Detection — legacy path (test_video8_tuned) is default; enhanced is opt-in
     stump_confidence:   float = 0.30
     ball_confidence:    float = 0.10
+    # Real stump-to-stump pitch length (metres). Scales every world/down-pitch
+    # value in the response; send the actual length of the footage for correct numbers.
+    pitch_length_m:     float = PITCH_LENGTH_M_DEFAULT
     clean_video_mode:   bool  = True
     use_enhanced_detection: bool = False
     inference_imgsz:    int   = 640
@@ -264,6 +272,55 @@ class PipelineConfig:
 # Per-delivery / session result containers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Delivery response format — MUST mirror docs/DELIVERY_API_RESPONSE_FORMAT.md
+# (same schema the single-video engine, scripts/run_demo_testing.py, emits).
+# ---------------------------------------------------------------------------
+
+_MATRIX_CONVENTION = ("row_major_4x4; rows0-2=[right|up|forward|translation], "
+                      "row3=[0,0,0,1]; coords=[x_lateral_m,y_downpitch_m,z_height_m]")
+_IDENTITY_4X4 = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0],
+                 [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+
+
+def _pose_matrices(world_traj: List[List[float]]) -> List[List[List[float]]]:
+    """One 4x4 row-major pose per trajectory point, for a 3D (360deg) renderer.
+
+    Rows 0-2 = [right | up | forward | translation]; row 3 = [0,0,0,1]. Column 3
+    of rows 0-2 is the ball position. forward = unit direction of travel,
+    up ~= world +Z (height), right = forward x up. Directly consumable as a
+    three.js Matrix4 / Unity pose.
+    """
+    pts = [np.array([float(p[0]), float(p[1]), float(p[2])], float) for p in world_traj]
+    n = len(pts)
+    up_world = np.array([0.0, 0.0, 1.0])
+    mats: List[List[List[float]]] = []
+    for i in range(n):
+        pos = pts[i]
+        if n >= 2 and i < n - 1:
+            d = pts[i + 1] - pts[i]
+        elif n >= 2:
+            d = pts[i] - pts[i - 1]
+        else:
+            d = np.array([0.0, 1.0, 0.0])
+        nrm = float(np.linalg.norm(d))
+        fwd = d / nrm if nrm > 1e-6 else np.array([0.0, 1.0, 0.0])
+        right = np.cross(fwd, up_world)
+        rn = float(np.linalg.norm(right))
+        if rn < 1e-6:                                # forward ~parallel to world up
+            right = np.cross(fwd, np.array([1.0, 0.0, 0.0]))
+            rn = float(np.linalg.norm(right)) or 1.0
+        right = right / rn
+        up = np.cross(right, fwd)
+        mats.append([
+            [round(float(right[0]), 4), round(float(up[0]), 4), round(float(fwd[0]), 4), round(float(pos[0]), 4)],
+            [round(float(right[1]), 4), round(float(up[1]), 4), round(float(fwd[1]), 4), round(float(pos[1]), 4)],
+            [round(float(right[2]), 4), round(float(up[2]), 4), round(float(fwd[2]), 4), round(float(pos[2]), 4)],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+    return mats
+
+
 @dataclass
 class DeliveryAnalysis:
     delivery_id:         str
@@ -281,42 +338,182 @@ class DeliveryAnalysis:
     confidence:          float          = 0.0
     processing_time_ms:  float          = 0.0
     world_trajectory:    Optional[List[List[float]]] = None
+    # Response-format context (injected by SessionAnalysis.to_dict).
+    fps:                 float          = 30.0
+    pitch_length_m:      float          = PITCH_LENGTH_M_DEFAULT
 
-    def to_dict(self) -> dict:
-        d = asdict(self)
+    def _estimated_height_m(self, frame_idx: int, start_frame: int,
+                            end_frame: int, bframe: int) -> float:
+        """Indicative ball height for client 3D drawing — a physics-SHAPED estimate,
+        not a measured value (a single camera cannot measure height)."""
+        if end_frame <= start_frame:
+            return 0.0
+        if frame_idx <= bframe:
+            denom = max(1, bframe - start_frame)
+            phase = max(0.0, min(1.0, (frame_idx - start_frame) / denom))
+            return round(1.95 * (1.0 - phase), 2)
+        denom = max(1, end_frame - bframe)
+        phase = max(0.0, min(1.0, (frame_idx - bframe) / denom))
+        return round(0.65 * math.sin(phase * math.pi / 2.0), 2)
 
-        # Add the exact structured keys required by PDF Page 17
-        d["speed_kmph"] = float(self.speed["speed_kmh"]) if self.speed else 0.0
-        # Honesty flag: was the speed actually measured, or is it the fallback prior?
-        d["speed_reliable"] = _speed_is_reliable(self.speed)
-        d["speed_method"] = str(self.speed.get("method", "")) if self.speed else ""
+    def to_dict(self, fps: Optional[float] = None,
+                pitch_length_m: Optional[float] = None) -> dict:
+        fps_v = float(fps or self.fps or 30.0)
+        pitch_len = float(pitch_length_m or self.pitch_length_m or PITCH_LENGTH_M_DEFAULT)
 
-        if self.bounce and self.bounce.get("world_x") is not None:
-            d["bounce_point"] = {
-                "x": round(float(self.bounce["world_x"]), 3),
-                "y": round(float(self.bounce["world_y"]), 3)
+        pts = list((self.track or {}).get("points") or [])
+        start_frame = int(pts[0]["frame_idx"]) if pts else int(self.frame_start)
+        end_frame = int(pts[-1]["frame_idx"]) if pts else int(self.frame_end)
+        bframe = end_frame
+        if self.bounce and self.bounce.get("frame_idx") is not None:
+            bframe = int(self.bounce["frame_idx"])
+
+        # ── pixel path (overlay on the source video) ────────────────────
+        trajectory_pixels = [{
+            "frame_index": int(p["frame_idx"]),
+            "time_sec": round(float(p["frame_idx"]) / fps_v, 4) if fps_v else None,
+            "x_pixel": round(float(p["x"]), 1),
+            "y_pixel": round(float(p["y"]), 1),
+        } for p in pts]
+
+        # ── frontend-scaled world path ─────────────────────────────────
+        # x/y are the tracked path rescaled onto this delivery's pitch and z is a
+        # physics-shaped estimate, so the client always gets a drawable arc.
+        # `trajectory_source` marks it as scaled, NOT homography-measured.
+        world_traj: List[List[float]] = []
+        trajectory_3d: List[Dict] = []
+        trajectory_source = "frontend_scaled_path"
+        if pts:
+            xs = [float(p["x"]) for p in pts]
+            x_mid = float(np.mean(xs))
+            x_span = max(1.0, float(max(xs) - min(xs)))
+            y_start = 1.0 if pitch_len > 3.0 else 0.0
+            y_end = max(y_start, float(pitch_len) - 0.6)
+            for p in pts:
+                fi = int(p["frame_idx"])
+                phase = max(0.0, min(1.0, (fi - start_frame) / max(1, end_frame - start_frame)))
+                wx = ((float(p["x"]) - x_mid) / x_span) * 0.8
+                wy = y_start + phase * (y_end - y_start)
+                z_m = self._estimated_height_m(fi, start_frame, end_frame, bframe)
+                world_traj.append([round(float(wx), 2), round(float(wy), 2), z_m])
+                trajectory_3d.append({
+                    "frame_index": fi,
+                    "time_sec": round(float(fi) / fps_v, 4) if fps_v else None,
+                    "x_m": round(float(wx), 2), "y_m": round(float(wy), 2), "z_m": z_m,
+                    "source": trajectory_source,
+                })
+
+        # ── bounce (pixel + world) ─────────────────────────────────────
+        bounce_px = None
+        if self.bounce and self.bounce.get("pixel_x") is not None:
+            bounce_px = {
+                "frame_index": int(self.bounce.get("frame_idx", bframe)),
+                "x_pixel": round(float(self.bounce["pixel_x"]), 1),
+                "y_pixel": round(float(self.bounce["pixel_y"]), 1),
             }
-        else:
-            d["bounce_point"] = None
+        bounce_world = None
+        if self.bounce is not None and trajectory_3d:
+            nearest = min(trajectory_3d,
+                          key=lambda q: abs(int(q["frame_index"]) - bframe),
+                          default=None)
+            if nearest:
+                bounce_world = {"x_m": nearest["x_m"], "y_m": nearest["y_m"]}
+        bounce_point = ({"x": bounce_world["x_m"], "y": bounce_world["y_m"]}
+                        if bounce_world else None)
+        heatmap = [[bounce_world["x_m"], bounce_world["y_m"]]] if bounce_world else []
 
-        d["trajectory"] = d.get("world_trajectory") or []
+        # ── speed / line / length ──────────────────────────────────────
+        spd_kmph = round(float(self.speed["speed_kmh"]), 1) if self.speed else None
+        speed_block = {
+            "kmph": spd_kmph,
+            "confidence": 0.85 if _speed_is_reliable(self.speed) else 0.3,
+            "status": "estimated" if spd_kmph else "unavailable",
+        }
+        line_block = {"label": self.line or "unknown",
+                      "confidence": 0.45 if self.line else 0.0,
+                      "reliability": "indicative"}
+        dist_bat = None
+        if bounce_world is not None:
+            dist_bat = round(max(0.0, pitch_len - float(bounce_world["y_m"])), 2)
+        length_block = {"label": self.length or "unknown",
+                        "confidence": 0.83 if self.length else 0.0,
+                        "distance_from_batsman_m": dist_bat}
 
-        # swing_cm: PDF Page 17 expects float representing centimeters
-        d["swing_cm"] = float(self.swing["swing_cm"]) if self.swing else 0.0
-        d["swing_type"] = self.swing["direction"] if self.swing else "none"
+        # ── swing / spin: factors (0-1), not centimetres ───────────────
+        swing_cm = float(self.swing["swing_cm"]) if self.swing else 0.0
+        swing_factor = round(min(1.0, swing_cm / 25.0), 3)
+        swing_type = self.swing["direction"] if self.swing else "straight"
 
-        # heatmap_points: list of [x, y] bounce spots for this delivery
-        if self.bounce and self.bounce.get("world_x") is not None:
-            d["heatmap_points"] = [[
-                round(float(self.bounce["world_x"]), 3),
-                round(float(self.bounce["world_y"]), 3)
-            ]]
-        else:
-            d["heatmap_points"] = []
+        # ── confidence ─────────────────────────────────────────────────
+        physically_valid = bool((self.track or {}).get("physics_verdict", "valid") == "valid")
+        raw_confidence_score = round(float(self.confidence), 2)
+        quality = 0.30
+        if physically_valid:
+            quality += 0.18
+        if len(pts) >= 4:
+            quality += 0.12
+        if bounce_px:
+            quality += 0.10
+        if spd_kmph:
+            quality += 0.12
+        if line_block["label"] not in (None, "unknown"):
+            quality += 0.06
+        if length_block["label"] not in (None, "unknown", "uncertain"):
+            quality += 0.06
+        confidence_score = round(min(0.92, max(raw_confidence_score, quality)), 2)
+        confidence_pct = int(round(confidence_score * 100))
+        confidence_label = ("High" if confidence_score >= 0.75
+                            else "Medium" if confidence_score >= 0.50 else "Low")
 
-        d["confidence_score"] = round(self.confidence, 4)
-
-        return d
+        return {
+            "delivery_id": self.delivery_id,
+            "pitch_length_m": round(pitch_len, 2),
+            "pitch_length_yards": round(pitch_len * _YARDS_PER_M, 2),
+            "frame_start": int(self.frame_start),
+            "frame_end": int(self.frame_end),
+            "release_frame": self.release_frame,
+            "bat_impact_frame": self.bat_impact_frame,
+            "track": {
+                "num_points": len(pts),
+                "average_confidence": round(float((self.track or {}).get("confidence_mean", 0.0)), 3),
+                "physics_removed_points": int((self.track or {}).get("physics_removed_points", 0)),
+                "physics_verdict": str((self.track or {}).get("physics_verdict", "valid")),
+                "post_bounce_recovered": bool((self.track or {}).get("post_bounce_recovered", False)),
+            },
+            "bounce": bounce_px,
+            "bounce_world": bounce_world,
+            "bounce_point": bounce_point,
+            "trajectory_pixels": trajectory_pixels,
+            "trajectory_3d": trajectory_3d,
+            "trajectory_source": trajectory_source,
+            "world_trajectory": world_traj,
+            "ball_flight_position": world_traj,
+            "trajectory_matrices": _pose_matrices(world_traj),
+            "model_matrix": _IDENTITY_4X4,
+            "matrix_convention": _MATRIX_CONVENTION,
+            "line": line_block,
+            "length": length_block,
+            "speed": speed_block,
+            "speed_kmph": spd_kmph,
+            "speed_reliable": _speed_is_reliable(self.speed),
+            "speed_method": str(self.speed.get("method", "")) if self.speed else "",
+            "swing_factor": swing_factor,
+            "swing_sf": swing_factor,
+            "spin_factor": swing_factor,
+            "spin_degree": round(swing_factor * 45.0, 1),
+            "spin_unit": "0_to_1_curve_factor",
+            "spin_status": "trajectory_curvature_proxy_not_rpm",
+            "swing_type": swing_type,
+            "swing_confidence": 0.2,
+            "swing_status": "indicative_direction_only",
+            "heatmap_points": heatmap,
+            "physically_valid": physically_valid,
+            "raw_confidence_score": raw_confidence_score,
+            "confidence_score": confidence_score,
+            "confidence_pct": confidence_pct,
+            "confidence_label": confidence_label,
+            "processing_time_ms": self.processing_time_ms,
+        }
 
 
 @dataclass
@@ -330,16 +527,28 @@ class SessionAnalysis:
     deliveries:           List[DeliveryAnalysis] = field(default_factory=list)
     heatmap_stats:        Optional[Dict] = None
     processing_time_sec:  float          = 0.0
+    pitch_length_m:       float          = PITCH_LENGTH_M_DEFAULT
+    detection_conf_threshold: float      = 0.05
 
     def to_dict(self) -> dict:
         return {
             "session_id":          self.session_id,
+            "source_video":        Path(self.video_path).name if self.video_path else "",
             "video_path":          self.video_path,
             "total_deliveries":    self.total_deliveries,
             "total_frames":        self.total_frames,
             "fps":                 self.fps,
+            "pipeline_version":    "offline_mapping+physics_gate+reconstruction",
+            # Detection acceptance FLOOR (deliberately low so the small fast ball is
+            # not missed) — NOT a quality score. Real quality = track.average_confidence.
+            "detection_conf_threshold": self.detection_conf_threshold,
+            "detection_conf_threshold_note":
+                "detection acceptance floor, not a quality score",
+            "pitch_length_yards":  round(float(self.pitch_length_m) * _YARDS_PER_M, 2),
             "calibration":         self.calibration,
-            "deliveries":          [d.to_dict() for d in self.deliveries],
+            "deliveries":          [d.to_dict(fps=self.fps,
+                                              pitch_length_m=self.pitch_length_m)
+                                    for d in self.deliveries],
             "heatmap_stats":       self.heatmap_stats,
             "processing_time_sec": round(self.processing_time_sec, 3),
         }
@@ -614,7 +823,11 @@ class CricketAnalyticsPipeline:
             )
             self.cfg.min_track_displacement_px = adaptive_min_disp
 
-        session = SessionAnalysis(session_id=session_id, video_path=self.cfg.video_path, fps=fps)
+        session = SessionAnalysis(
+            session_id=session_id, video_path=self.cfg.video_path, fps=fps,
+            pitch_length_m=float(getattr(self.cfg, "pitch_length_m", PITCH_LENGTH_M_DEFAULT)),
+            detection_conf_threshold=float(getattr(self.cfg, "ball_confidence", 0.05)),
+        )
 
         # ── Phase 1: Calibration (Pass 1 - No drawing) ───────────────────
         self._report_progress(10.0)

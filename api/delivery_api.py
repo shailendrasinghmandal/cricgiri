@@ -20,18 +20,21 @@ Run (GPU venv):
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import threading
+import shutil
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import (FastAPI, File, Form, Header, HTTPException, UploadFile,
+                     WebSocket, WebSocketDisconnect)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -52,6 +55,7 @@ except Exception:
 
 logger = logging.getLogger("cricgiri.delivery_api")
 ALLOWED_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+OUTPUT_DIR = ROOT / "outputs" / "delivery_api"
 
 # The ball/stump YOLO models are shared singletons and torch inference is NOT thread-safe;
 # run_in_threadpool would otherwise run requests concurrently on the same model. Serialise
@@ -93,16 +97,93 @@ def health() -> dict:
     return {
         "status": "ok",
         "model_loaded": engine._ENGINE["models"] is not None,
+        "ball_models": engine._ENGINE.get("model_paths") or ["models/ball_ft_t4.pt"],
         "device": engine._ENGINE["device"],
         "pitch_length_default_m": engine.PITCH_LEN,
         "pipeline_version": "offline_mapping+physics_gate+reconstruction",
     }
 
 
+@app.get("/analysis/{result_id}/video")
+def get_output_video(result_id: str) -> FileResponse:
+    """Return the trajectory-rendered output video for a previous /analyze call."""
+    safe_id = "".join(ch for ch in result_id if ch.isalnum() or ch in ("-", "_"))
+    if safe_id != result_id:
+        raise HTTPException(400, "Invalid result id")
+    path = OUTPUT_DIR / safe_id / "trajectory_web.mp4"
+    if not path.exists():
+        path = OUTPUT_DIR / safe_id / "trajectory.mp4"
+    if not path.exists():
+        raise HTTPException(404, "Output video not found or not ready")
+    return FileResponse(path, media_type="video/mp4", filename=f"{result_id}_trajectory.mp4")
+
+
+def _make_output_video(stem: str, result_id: str) -> Optional[str]:
+    """Render the detected trajectory video and return its local API URL."""
+    out_dir = OUTPUT_DIR / result_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = out_dir / "trajectory.mp4"
+
+    # Prefer the corrected renderer used for the cleaner/full trajectory demos:
+    # it remaps the full video and renders a segmented physics arc instead of
+    # only drawing a spline through the sparse JSON track points.
+    try:
+        from pipeline_corrected import run_corrected
+
+        corrected = run_corrected(
+            ROOT / "videos" / f"{stem}.mp4",
+            out=raw_path,
+            extend=0.15,
+            cleanup_staged=False,
+            capture=True,
+        )
+        if corrected.get("ok"):
+            web = corrected.get("web_mp4")
+            if web:
+                web_path = Path(web)
+                target = out_dir / "trajectory_web.mp4"
+                if web_path.exists() and web_path != target:
+                    shutil.copy2(web_path, target)
+            return f"/analysis/{result_id}/video"
+        logger.warning("corrected video render failed: %s", corrected.get("error"))
+    except Exception:  # noqa: BLE001
+        logger.warning("corrected video render skipped", exc_info=True)
+
+    # Fallback: render the same clean mapped points used by the JSON result.
+    pts = engine.dr.read_points(stem)
+    render_pts = engine.clean_for_render(pts)
+    ok, _ = engine.render_clean(stem, render_pts, raw_path)
+    if not ok or not raw_path.exists():
+        return None
+
+    try:
+        from api.video_utils import transcode_to_web
+
+        web_path = transcode_to_web(raw_path)
+        if web_path and web_path.exists():
+            target = out_dir / "trajectory_web.mp4"
+            if web_path != target:
+                shutil.copy2(web_path, target)
+    except Exception:  # noqa: BLE001
+        logger.warning("video transcode skipped", exc_info=True)
+
+    return f"/analysis/{result_id}/video"
+
+
+def _cleanup_engine_temp(stem: str) -> None:
+    (ROOT / "videos" / f"{stem}.mp4").unlink(missing_ok=True)
+    shutil.rmtree(ROOT / "outputs" / "mapped" / stem, ignore_errors=True)
+    shutil.rmtree(ROOT / "outputs" / "detections" / stem, ignore_errors=True)
+
+
 @app.post("/analyze")
 async def analyze(
     video: UploadFile = File(..., description="Cricket delivery video (mp4/mov/avi/mkv/webm)"),
     pitch_length: float = Form(20.12, description="Real stump-to-stump pitch length in metres"),
+    pitch_length_yards: Optional[float] = Form(
+        default=None,
+        description="Optional pitch length in yards. If provided, overrides pitch_length metres.",
+    ),
     x_api_key: Optional[str] = Header(default=None),
 ) -> JSONResponse:
     """Analyse one delivery video and return the schema-compliant JSON.
@@ -123,6 +204,9 @@ async def analyze(
     up_dir.mkdir(parents=True, exist_ok=True)
     tmp = up_dir / f"upload_{uuid.uuid4().hex[:10]}{ext}"
     tmp.write_bytes(data)
+    result_id = uuid.uuid4().hex[:12]
+    work_id = f"api_{result_id}"
+    pitch_length_m = float(pitch_length_yards) * 0.9144 if pitch_length_yards else float(pitch_length)
 
     t0 = time.perf_counter()
 
@@ -131,7 +215,19 @@ async def analyze(
         # serialises the actual inference (shared, non-thread-safe models); the unique
         # per-call work-id keeps each request's temp files isolated.
         with _INFER_LOCK:
-            return engine.analyze_video(str(tmp), pitch_length=float(pitch_length))
+            result = engine.analyze_video(
+                str(tmp),
+                pitch_length=pitch_length_m,
+                work_id=work_id,
+                cleanup=False,
+            )
+            video_url = None
+            if int(result.get("total_deliveries") or 0) > 0:
+                video_url = _make_output_video(work_id, result_id)
+            result["result_id"] = result_id
+            result["output_video"] = video_url
+            result["output_video_url"] = video_url
+            return result
 
     try:
         result = await run_in_threadpool(_run)
@@ -140,6 +236,107 @@ async def analyze(
         raise HTTPException(500, f"analysis failed: {type(exc).__name__}: {exc}")
     finally:
         tmp.unlink(missing_ok=True)
+        _cleanup_engine_temp(work_id)
 
     result["processing_sec"] = round(time.perf_counter() - t0, 1)
-    return JSONResponse(result)
+    # Pretty-print (indent + stable key order) so the response is human-readable when
+    # the team inspects it directly; harmless to programmatic consumers.
+    import json as _json
+    return Response(
+        content=_json.dumps(result, indent=2, ensure_ascii=False, default=str),
+        media_type="application/json",
+    )
+
+
+@app.websocket("/ws/analyze")
+async def ws_analyze(websocket: WebSocket) -> None:
+    """Live WebSocket analysis: connect, send the video, receive progress + result.
+
+    Protocol
+    --------
+      1. Client connects to   ws(s)://<host>/ws/analyze?pitch_length=20.12
+      2. Client sends the whole video file as ONE binary message.
+      3. Server streams JSON text messages:
+             {"type":"status","stage":"received","progress":5}
+             {"type":"status","stage":"analyzing","progress":10..90}   (heartbeat)
+             {"type":"result","progress":100,"result":{...delivery JSON...}}
+         then closes. On failure: {"type":"error","message":"..."}.
+
+    `pitch_length` may be given as a query param, or as an initial JSON *text*
+    message {"pitch_length": 20.12} sent before the binary video.
+    """
+    await websocket.accept()
+    tmp: Optional[Path] = None
+    try:
+        # Optional auth (only if API_KEY is configured): ?api_key=...
+        if API_KEY and websocket.query_params.get("api_key") != API_KEY:
+            await websocket.send_json({"type": "error", "message": "invalid or missing api_key"})
+            await websocket.close(code=1008)
+            return
+
+        pitch_length = float(websocket.query_params.get("pitch_length", engine.PITCH_LEN))
+
+        # First frame may be JSON metadata (text) or the video itself (binary).
+        first = await websocket.receive()
+        video_bytes: Optional[bytes] = first.get("bytes")
+        if video_bytes is None and first.get("text"):
+            try:
+                meta = __import__("json").loads(first["text"])
+                pitch_length = float(meta.get("pitch_length", pitch_length))
+            except Exception:                                          # noqa: BLE001
+                pass
+            nxt = await websocket.receive()                            # then the binary video
+            video_bytes = nxt.get("bytes")
+
+        if not video_bytes:
+            await websocket.send_json({"type": "error", "message": "no video bytes received"})
+            await websocket.close(code=1003)
+            return
+
+        await websocket.send_json({
+            "type": "status", "stage": "received", "progress": 5,
+            "message": f"received {len(video_bytes)} bytes",
+        })
+
+        up_dir = ROOT / "uploads"
+        up_dir.mkdir(parents=True, exist_ok=True)
+        tmp = up_dir / f"ws_{uuid.uuid4().hex[:10]}.mp4"
+        tmp.write_bytes(video_bytes)
+
+        # Run the (blocking, GPU-bound) analysis in a worker thread; _INFER_LOCK
+        # serialises the shared, non-thread-safe models. Heartbeat progress is
+        # coarse (the engine runs as one call) but keeps the client's bar moving.
+        loop = asyncio.get_event_loop()
+        t0 = time.perf_counter()
+
+        def _run() -> dict:
+            with _INFER_LOCK:
+                return engine.analyze_video(str(tmp), pitch_length=float(pitch_length))
+
+        task = loop.run_in_executor(None, _run)
+
+        pct = 10
+        await websocket.send_json({"type": "status", "stage": "analyzing", "progress": pct})
+        while not task.done():
+            await asyncio.sleep(1.5)
+            if pct < 90:
+                pct += 5
+            await websocket.send_json({"type": "status", "stage": "analyzing", "progress": pct})
+
+        result = await task
+        result["processing_sec"] = round(time.perf_counter() - t0, 1)
+        await websocket.send_json({"type": "result", "progress": 100, "result": result})
+        await websocket.close()
+
+    except WebSocketDisconnect:
+        logger.info("ws client disconnected")
+    except Exception as exc:                                           # noqa: BLE001
+        logger.exception("ws analysis failed")
+        try:
+            await websocket.send_json({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+            await websocket.close(code=1011)
+        except Exception:                                              # noqa: BLE001
+            pass
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)

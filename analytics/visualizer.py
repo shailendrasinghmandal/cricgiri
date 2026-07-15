@@ -78,6 +78,7 @@ class VisualFrame:
     ball_pixel:         Optional[Tuple[float, float]] = None
     speed_kmh:          float = 0.0
     speed_mph:          float = 0.0
+    speed_reliable:     bool  = True         # False => measurement was prior/implausible
     swing_deg:          float = 0.0          # lateral deviation (display value)
     spin_rpm:           float = 0.0          # drift/turn angle in degrees (NOT RPM per PDF)
     swing_label:        str   = "none"       # "outswing" | "inswing" | "reverse" | "none"
@@ -1008,9 +1009,16 @@ def draw_fulltrack_hud(
     spin_str = f"{spin_val:.1f}" if spin_val > 0 else "0.0"
     cards.append(("Drift", spin_str, "deg"))  # drift/turn angle in degrees (per PDF)
 
-    # Card 3: Speed
+    # Card 3: Speed — only show a number when it is a real measurement.
+    # A low-confidence "prior" (e.g. the 110 km/h fallback) must NOT be shown as
+    # if it were measured, so it renders as "~est" instead of a misleading value.
     speed_val = vis.speed_kmh
-    speed_str = f"{int(speed_val)}" if speed_val > 0 else "---"
+    if speed_val > 0 and vis.speed_reliable:
+        speed_str = f"{int(speed_val)}"
+    elif speed_val > 0:
+        speed_str = "~est"
+    else:
+        speed_str = "---"
     cards.append(("Speed", speed_str, "km/h"))
 
     for i, (label, value, unit) in enumerate(cards):

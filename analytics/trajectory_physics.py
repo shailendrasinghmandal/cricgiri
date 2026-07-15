@@ -109,6 +109,109 @@ def predict_future_trajectory(
     return out
 
 
+def _fit_velocity_accel(
+    points: List[Tuple[float, float]],
+    dt: float,
+    window: int = 6,
+) -> Tuple[float, float, float, float]:
+    """
+    Robust velocity / acceleration estimate from the tail of the path.
+
+    Fits a low-order polynomial to the last ``window`` points in each axis and
+    reads its derivative at the final sample, instead of a noisy 3-point finite
+    difference. Returns (vx, vy, ax, ay) in px/s and px/s².
+    """
+    n = len(points)
+    w = max(3, min(window, n))
+    tail = points[-w:]
+    t = np.arange(w, dtype=np.float64) * dt
+    xs = np.array([p[0] for p in tail], dtype=np.float64)
+    ys = np.array([p[1] for p in tail], dtype=np.float64)
+
+    # Quadratic fit gives velocity + (constant) acceleration; fall back to linear.
+    deg = 2 if w >= 4 else 1
+    try:
+        cx = np.polyfit(t, xs, deg)
+        cy = np.polyfit(t, ys, deg)
+    except (np.linalg.LinAlgError, ValueError):
+        return 0.0, 0.0, 0.0, 0.0
+
+    t_end = t[-1]
+    if deg == 2:
+        vx = 2 * cx[0] * t_end + cx[1]
+        vy = 2 * cy[0] * t_end + cy[1]
+        ax = 2 * cx[0]
+        ay = 2 * cy[0]
+    else:
+        vx, vy = cx[0], cy[0]
+        ax = ay = 0.0
+    return float(vx), float(vy), float(ax), float(ay)
+
+
+def predict_future_trajectory_v2(
+    points: List[Tuple[float, float]],
+    fps: float = 30.0,
+    pixels_per_meter: float = 38.0,
+    n_future: int = 12,
+    ground_y: Optional[float] = None,
+    restitution: float = 0.55,
+    horizontal_friction: float = 0.82,
+    use_fitted_gravity: bool = True,
+) -> List[Tuple[float, float]]:
+    """
+    Improved physics-based future extrapolation (pixel/screen space).
+
+    Improvements over :func:`predict_future_trajectory`:
+      * velocity/acceleration are read from a polynomial fit of the path tail
+        (robust to jitter) rather than a single 3-point difference;
+      * vertical acceleration can be taken from the *observed* motion
+        (``use_fitted_gravity``) so swing/dip is honoured, clamped to a sane
+        gravity band so noise can't invert the arc;
+      * a real bounce model: when the ball reaches the pitch plane (``ground_y``,
+        defaulting to the lowest observed screen-Y), vertical velocity reflects
+        with ``restitution`` and horizontal velocity is scaled by
+        ``horizontal_friction`` — and it can bounce more than once;
+      * post-bounce continuation keeps producing a physically plausible arc
+        instead of a single hard flip.
+
+    Returns a list of future (x, y) pixel points (length ``n_future``).
+    """
+    if len(points) < 3 or fps <= 0:
+        return []
+
+    dt = 1.0 / fps
+    vx, vy, ax_obs, ay_obs = _fit_velocity_accel(points, dt)
+
+    # Gravity in pixel space (downward = +y on screen).
+    g_px = (9.81 / max(pixels_per_meter, 1e-6))
+    if use_fitted_gravity:
+        # Trust the observed vertical acceleration but clamp to [0.4g, 2.5g]
+        # so a noisy fit can't flip the ball upward or fling it down.
+        ay = float(np.clip(ay_obs, 0.4 * g_px, 2.5 * g_px))
+    else:
+        ay = g_px
+    ax = 0.0  # horizontal accel assumed ~0 (swing already baked into vx via fit)
+
+    # Pitch plane: lowest point the ball has reached on screen, unless given.
+    if ground_y is None:
+        ground_y = max(p[1] for p in points)
+
+    x, y = points[-1][0], points[-1][1]
+    out: List[Tuple[float, float]] = []
+    for _ in range(max(1, int(n_future))):
+        vx += ax * dt
+        vy += ay * dt
+        x += vx * dt
+        y += vy * dt
+        # Bounce when crossing the pitch plane while descending.
+        if y >= ground_y and vy > 0:
+            y = ground_y - (y - ground_y)  # reflect position above the plane
+            vy = -abs(vy) * restitution
+            vx *= horizontal_friction
+        out.append((float(x), float(y)))
+    return out
+
+
 def estimate_swing_direction(
     world_points: List[Tuple[float, float, float]],
 ) -> str:

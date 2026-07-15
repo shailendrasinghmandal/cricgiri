@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CricGiri Delivery Analytics API — Team Guide</title>
+<style>
+  :root{
+    --bg:#0f1720; --card:#182430; --card2:#1e2c3a; --line:#2b3a4a;
+    --tx:#e7eef5; --mut:#93a4b5; --acc:#38c172; --accd:#2f9e5e;
+    --red:#e3564a; --amber:#e0a458; --code:#0b1218; --blue:#59a5f5;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f4f7fa; --card:#ffffff; --card2:#f0f4f8; --line:#dde5ec;
+      --tx:#16222e; --mut:#5a6b7a; --code:#f2f5f8; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);
+    font:15px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:860px;margin:0 auto;padding:28px 20px 60px}
+  h1{font-size:24px;margin:0 0 2px} h2{font-size:16px;margin:26px 0 10px;
+    color:var(--tx)} .sub{color:var(--mut);margin:0 0 22px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:18px;margin:14px 0}
+  label{display:block;font-size:13px;color:var(--mut);margin:10px 0 4px}
+  input[type=text],input[type=number]{width:100%;padding:10px 12px;border-radius:8px;
+    border:1px solid var(--line);background:var(--card2);color:var(--tx);font-size:14px}
+  input[type=file]{color:var(--tx);font-size:14px;margin-top:6px}
+  button{background:var(--acc);color:#04140a;border:0;border-radius:8px;
+    padding:10px 16px;font-weight:600;font-size:14px;cursor:pointer}
+  button:hover{background:var(--accd)} button:disabled{opacity:.5;cursor:wait}
+  button.ghost{background:transparent;color:var(--tx);border:1px solid var(--line);font-weight:500}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
+  .row>div{flex:1;min-width:180px}
+  .pill{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;
+    font-size:13px;font-weight:600}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .ok{background:rgba(56,193,114,.14);color:var(--acc)} .ok .dot{background:var(--acc)}
+  .bad{background:rgba(227,86,74,.14);color:var(--red)} .bad .dot{background:var(--red)}
+  .wait{background:rgba(224,164,88,.14);color:var(--amber)} .wait .dot{background:var(--amber)}
+  .mut{color:var(--mut)} .small{font-size:13px}
+  table{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:6px}
+  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--mut);font-weight:600}
+  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  code{background:var(--code);padding:2px 6px;border-radius:5px;font-size:13px}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:14px;
+    overflow:auto;font-size:12.5px;max-height:440px}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin:12px 0}
+  .stat{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  .stat b{display:block;font-size:19px} .stat span{font-size:11.5px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+  a{color:var(--blue)}
+  .foot{color:var(--mut);font-size:12.5px;margin-top:30px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>🏏 CricGiri Delivery Analytics API</h1>
+  <p class="sub">Upload a cricket-delivery video → get trajectory, bounce, line, length, speed &amp; swing as JSON.</p>
+
+  <!-- ── Connection ─────────────────────────────────────────── -->
+  <div class="card">
+    <h2 style="margin-top:0">1 · API address &amp; status</h2>
+    <label>API base URL (paste your Space URL, no trailing slash)</label>
+    <input id="base" type="text" placeholder="https://your-user-your-space.hf.space" spellcheck="false">
+    <div class="row" style="margin-top:12px">
+      <div style="flex:0 0 auto"><button id="ping">Test connection</button></div>
+      <div style="flex:0 0 auto"><button class="ghost" id="opendocs">Open /docs test page ↗</button></div>
+      <div style="flex:1;text-align:right"><span id="status" class="pill wait"><span class="dot"></span>not tested</span></div>
+    </div>
+    <p id="statusdetail" class="small mut" style="margin:10px 0 0"></p>
+  </div>
+
+  <!-- ── Try it ────────────────────────────────────────────── -->
+  <div class="card">
+    <h2 style="margin-top:0">2 · Analyze a video</h2>
+    <div class="row">
+      <div>
+        <label>Video file (mp4 / mov / avi / mkv / webm)</label>
+        <input id="video" type="file" accept="video/*">
+      </div>
+      <div style="flex:0 0 170px">
+        <label>Pitch length (m)</label>
+        <input id="pitch" type="number" step="0.01" value="20.12">
+      </div>
+      <div style="flex:0 0 auto"><button id="run">Analyze →</button></div>
+    </div>
+    <p class="small mut" style="margin:10px 0 0">⏱ Runs on a free CPU host — a clip takes ~1–3 min. First call after idle wakes the server (~30 s).</p>
+
+    <div id="result" style="display:none;margin-top:16px">
+      <div id="cards" class="stats"></div>
+      <label style="margin-top:4px">Full JSON response</label>
+      <pre id="json"></pre>
+    </div>
+  </div>
+
+  <!-- ── Reference ─────────────────────────────────────────── -->
+  <div class="card">
+    <h2 style="margin-top:0">3 · Endpoints</h2>
+    <table>
+      <tr><th>Method / path</th><th>What it does</th></tr>
+      <tr><td><code>GET /health</code></td><td>Liveness — model &amp; device loaded</td></tr>
+      <tr><td><code>GET /docs</code></td><td>Built-in interactive test page</td></tr>
+      <tr><td><code>POST /analyze</code></td><td>form: <code>video</code> (file), <code>pitch_length</code> (float) → delivery JSON</td></tr>
+    </table>
+    <h2>Call it from code</h2>
+    <pre id="curl">curl -X POST "BASE/analyze" \
+  -F "video=@clip.mp4" \
+  -F "pitch_length=20.12"</pre>
+    <h2>Response fields</h2>
+    <table>
+      <tr><th>Field</th><th>Meaning</th></tr>
+      <tr><td><code>fps</code>, <code>total_frames</code>, <code>total_deliveries</code></td><td>Clip metadata + deliveries detected</td></tr>
+      <tr><td><code>track</code></td><td>num_points, average_confidence, physics_verdict, post_bounce_recovered</td></tr>
+      <tr><td><code>bounce</code> / <code>bounce_world</code></td><td>Bounce in pixels / in real pitch metres</td></tr>
+      <tr><td><code>world_trajectory</code></td><td>Ball path as <code>[x_m, y_m, z_m]</code> (lateral, down-pitch, height)</td></tr>
+      <tr><td><code>line</code> / <code>length</code></td><td>Bowling line &amp; length + confidence</td></tr>
+      <tr><td><code>speed</code> / <code>speed_kmph</code></td><td>Estimated pace in km/h</td></tr>
+      <tr><td><code>swing_cm</code> / <code>swing_type</code></td><td>Swing amount &amp; direction (in/out/straight)</td></tr>
+      <tr><td><code>confidence_score</code>, <code>physically_valid</code></td><td>Overall trust in the delivery result</td></tr>
+    </table>
+  </div>
+
+  <p class="foot">CricGiri • pipeline: offline_mapping + physics_gate + reconstruction</p>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const KEY = "cricgiri_api_base";
+const clean = () => $("base").value.trim().replace(/\/+$/,"");
+
+// restore saved URL
+$("base").value = localStorage.getItem(KEY) || "";
+syncCurl();
+
+$("base").addEventListener("input", ()=>{ localStorage.setItem(KEY, clean()); syncCurl(); });
+$("opendocs").onclick = ()=>{ const b=clean(); if(b) window.open(b+"/docs","_blank"); else alert("Enter the API base URL first."); };
+$("ping").onclick = ping;
+$("run").onclick = analyze;
+
+function syncCurl(){ $("curl").textContent =
+  `curl -X POST "${clean()||"BASE"}/analyze" \\\n  -F "video=@clip.mp4" \\\n  -F "pitch_length=20.12"`; }
+
+function setStatus(cls, text, detail){
+  const s=$("status"); s.className="pill "+cls;
+  s.innerHTML='<span class="dot"></span>'+text;
+  $("statusdetail").textContent = detail||"";
+}
+
+async function ping(){
+  const b=clean();
+  if(!b){ setStatus("bad","enter a URL","Paste your Space URL above, e.g. https://user-space.hf.space"); return; }
+  setStatus("wait","checking…","");
+  try{
+    const t0=performance.now();
+    const r=await fetch(b+"/health",{method:"GET"});
+    const ms=Math.round(performance.now()-t0);
+    if(!r.ok){ setStatus("bad","HTTP "+r.status,"Server reached but returned an error."); return; }
+    const j=await r.json();
+    setStatus("ok","LIVE",
+      `model_loaded=${j.model_loaded} · device=${j.device} · ${j.pipeline_version||""} · ${ms} ms`);
+  }catch(e){
+    setStatus("bad","NOT reachable",
+      "Could not connect. The Space may be sleeping (retry in ~30 s), the URL may be wrong, or it isn't deployed yet.");
+  }
+}
+
+async function analyze(){
+  const b=clean();
+  const f=$("video").files[0];
+  if(!b){ alert("Enter the API base URL first."); return; }
+  if(!f){ alert("Choose a video file first."); return; }
+  const btn=$("run"); btn.disabled=true; btn.textContent="Analyzing… (up to a few min)";
+  $("result").style.display="none";
+  try{
+    const fd=new FormData();
+    fd.append("video",f);
+    fd.append("pitch_length",$("pitch").value||"20.12");
+    const r=await fetch(b+"/analyze",{method:"POST",body:fd});
+    const j=await r.json();
+    $("json").textContent=JSON.stringify(j,null,2);
+    renderCards(j);
+    $("result").style.display="block";
+    if(!r.ok) setStatus("bad","HTTP "+r.status,"Analyze returned an error — see JSON below.");
+  }catch(e){
+    $("json").textContent="Request failed: "+e.message+
+      "\n\nIf the server was asleep it may have timed out — try again.";
+    $("cards").innerHTML=""; $("result").style.display="block";
+  }finally{ btn.disabled=false; btn.textContent="Analyze →"; }
+}
+
+function renderCards(j){
+  const d=(j.deliveries&&j.deliveries[0])||null;
+  const box=$("cards");
+  if(!d){ box.innerHTML='<div class="stat"><b>0</b><span>deliveries found</span></div>'; return; }
+  const num = x => (x==null?"—":x);
+  const cards=[
+    ["speed_kmph", d.speed_kmph!=null? d.speed_kmph+" km/h":"—"],
+    ["line", d.line? d.line.label:"—"],
+    ["length", d.length? d.length.label:"—"],
+    ["bounce y_m", d.bounce_world? d.bounce_world.y_m:"—"],
+    ["track pts", d.track? d.track.num_points:"—"],
+    ["confidence", d.confidence_score!=null? d.confidence_score:"—"],
+  ];
+  box.innerHTML=cards.map(c=>`<div class="stat"><b>${c[1]}</b><span>${c[0]}</span></div>`).join("");
+}
+</script>
+</body>
+</html>

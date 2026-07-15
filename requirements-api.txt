@@ -1,5 +1,7 @@
 # API deployment dependencies (install on top of requirements.txt)
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
+websockets>=12.0
 python-multipart>=0.0.9
 pydantic-settings>=2.2.0
+imageio-ffmpeg>=0.5.1   # bundled ffmpeg → transcode annotated output to browser-playable H.264

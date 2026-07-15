@@ -23,7 +23,10 @@ if not exist "%CF%" (
 
 echo.
 echo Starting the API server (loading models, ~15s) ...
-start "CricGiri API" cmd /c "venv\Scripts\python.exe -m uvicorn api.delivery_api:app --host 0.0.0.0 --port 8000"
+set "CRICGIRI_BALL_MODELS=ball_ft_t4.pt,ball_best_leather_new.pt"
+set "CRICGIRI_CONF=0.05"
+set "CRICGIRI_IMGSZ=1280"
+start "CricGiri Pipeline API" cmd /c "venv\Scripts\python.exe -m uvicorn api.delivery_api:app --host 0.0.0.0 --port 8000"
 
 echo Waiting for the server to come up ...
 :waitloop

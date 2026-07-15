@@ -21,6 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from analytics.analytics_engine import AnalyticsEngine
 from tracking.track_ball import BallTracker, Detection, TrackerPhase, parse_yolo_detections, TrackPoint, TrackResult
 from tracking.physics_constraints import PhysicsMotionFilter, PhysicsConstraintConfig
+from tracking.rts_smoother import RTSConfig
+from analytics.projectile_fit import ProjectileFitConfig
 from tracking.production_config import ProductionTrackingConfig, apply_production_cli
 from tracking.high_accuracy_config import HighAccuracyConfig, apply_high_accuracy_cli
 from tracking.yolo_inference import (
@@ -99,6 +101,22 @@ MIN_TRACK_POINTS: int        = 5     # minimum tracked points to count as a deli
 HUD_ALPHA: float             = 0.62  # HUD overlay transparency
 
 
+def _speed_is_reliable(speed: Optional[dict]) -> bool:
+    """A speed reading is a real measurement only if it did NOT come from the
+    fallback prior / out-of-band substitution and carries enough confidence.
+    The 110 km/h ``median_prior`` and ``*_outside_band_median`` / ``coarse``
+    methods are placeholders and must not be presented as measured."""
+    if not speed:
+        return False
+    method = str(speed.get("method", "")).lower()
+    if any(k in method for k in ("prior", "median", "outside_band", "coarse")):
+        return False
+    try:
+        return float(speed.get("confidence", 0.0)) >= 0.30
+    except (TypeError, ValueError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -148,6 +166,48 @@ class PipelineConfig:
     enable_physics_future: bool = True
     export_track_csv: bool = True
     frame_skip: int = 0
+
+    # Offline RTS backward smoothing of the finalized track (opt-in, default off).
+    # Re-estimates every frame using past + future frames to remove jitter and
+    # stabilise coasted gaps. Does not change detection or live tracking.
+    enable_rts_smoothing: bool = False
+    rts_process_noise: float = 2.0
+    rts_measurement_noise: float = 6.0
+
+    # Forward-backward consistency check on the optical-flow fallback (opt-in).
+    # Rejects unreliable LK matches that silently drift on blurred balls.
+    optical_flow_fb_check: bool = False
+
+    # Physics/projectile path fit on the finalized release->bat track (opt-in).
+    # Fits projectile motion (parabola split at bounce) through real detections
+    # and reconstructs blurred/missed frames on that arc. Self-guarded.
+    enable_projectile_fit: bool = False
+    projectile_blend: float = 0.85
+    projectile_max_residual_px: float = 26.0
+
+    # Temporal-validated low-confidence detection recovery (opt-in). Recovers
+    # weak-but-real ball detections on the predicted motion path that the standard
+    # confidence gate rejects — raises detection density without retraining.
+    enable_temporal_recovery: bool = False
+    recovery_conf_floor: float = 0.015
+    recovery_radius_scale: float = 1.4
+
+    # Adaptive RELEASE search corridor (opt-in): in the early post-release window,
+    # accept weak detections inside a velocity-aligned corridor (long along motion,
+    # narrow perpendicular) — reaches the tiny fast release ball without admitting
+    # lateral phantoms. Never invents detections (honesty preserved).
+    enable_release_corridor: bool = False
+    release_corridor_frames: int = 12
+    release_corridor_long: float = 2.4
+    release_corridor_lat: float = 0.55
+    # Multi-hypothesis release tracker (opt-in): accumulate evidence over a small
+    # hypothesis set during the release window; rescue a real detection the
+    # single-state associator dropped when one hypothesis is clearly dominant.
+    enable_release_mht: bool = False
+
+    # Physics gap-bridge (opt-in): fill lost-detection frames between real anchors
+    # with projectile motion + bounce restitution (hard-coded laws of motion).
+    enable_physics_bridge: bool = False
 
     # Presets (see --match-should-output / --blur-recovery)
     match_should_output: bool = False
@@ -224,10 +284,13 @@ class DeliveryAnalysis:
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        
+
         # Add the exact structured keys required by PDF Page 17
         d["speed_kmph"] = float(self.speed["speed_kmh"]) if self.speed else 0.0
-        
+        # Honesty flag: was the speed actually measured, or is it the fallback prior?
+        d["speed_reliable"] = _speed_is_reliable(self.speed)
+        d["speed_method"] = str(self.speed.get("method", "")) if self.speed else ""
+
         if self.bounce and self.bounce.get("world_x") is not None:
             d["bounce_point"] = {
                 "x": round(float(self.bounce["world_x"]), 3),
@@ -235,13 +298,13 @@ class DeliveryAnalysis:
             }
         else:
             d["bounce_point"] = None
-            
+
         d["trajectory"] = d.get("world_trajectory") or []
-        
+
         # swing_cm: PDF Page 17 expects float representing centimeters
         d["swing_cm"] = float(self.swing["swing_cm"]) if self.swing else 0.0
         d["swing_type"] = self.swing["direction"] if self.swing else "none"
-        
+
         # heatmap_points: list of [x, y] bounce spots for this delivery
         if self.bounce and self.bounce.get("world_x") is not None:
             d["heatmap_points"] = [[
@@ -250,9 +313,9 @@ class DeliveryAnalysis:
             ]]
         else:
             d["heatmap_points"] = []
-            
+
         d["confidence_score"] = round(self.confidence, 4)
-        
+
         return d
 
 
@@ -337,6 +400,27 @@ class CricketAnalyticsPipeline:
             enable_optical_flow=config.enable_tracker_optical_flow,
             byte_low_ratio=config.byte_low_ratio,
             interpolation_method=config.track_interpolation,
+            enable_rts_smooth=bool(config.enable_rts_smoothing),
+            rts_config=RTSConfig(
+                process_noise=float(config.rts_process_noise),
+                measurement_noise=float(config.rts_measurement_noise),
+            ),
+            optical_flow_fb_check=bool(config.optical_flow_fb_check),
+            enable_projectile_fit=bool(config.enable_projectile_fit),
+            projectile_config=ProjectileFitConfig(
+                blend=float(config.projectile_blend),
+                max_residual_px=float(config.projectile_max_residual_px),
+            ),
+            enable_temporal_recovery=bool(config.enable_temporal_recovery),
+            recovery_conf_floor=float(config.recovery_conf_floor),
+            recovery_radius_scale=float(config.recovery_radius_scale),
+            enable_release_corridor=bool(config.enable_release_corridor),
+            release_corridor_frames=int(config.release_corridor_frames),
+            release_corridor_long=float(config.release_corridor_long),
+            release_corridor_lat=float(config.release_corridor_lat),
+            enable_release_mht=bool(config.enable_release_mht),
+            enable_physics_bridge=bool(config.enable_physics_bridge),
+            physics_bridge_ppm=float(config.pixels_per_meter),
         )
         det_cfg = BallDetectionConfig(
             ball_confidence=float(config.ball_confidence),
@@ -683,9 +767,23 @@ class CricketAnalyticsPipeline:
         if final_delivery:
             session.deliveries.append(final_delivery)
 
+        # Drop deliveries built on a static phantom (real detections all piled
+        # at one pixel). A real ball is never stationary, so such a "track" is a
+        # fixed background object the detector latched onto — rendering it would
+        # draw a trajectory where there is no ball (e.g. before the delivery).
+        before_n = len(session.deliveries)
+        session.deliveries = [
+            d for d in session.deliveries if not self._is_static_phantom_track(d)
+        ]
+        if len(session.deliveries) < before_n:
+            logger.info(
+                "Dropped %d static-phantom delivery track(s).",
+                before_n - len(session.deliveries),
+            )
+
         if not session.deliveries:
             cache_fallback = self._fallback_delivery_from_cache(total_frames)
-            if cache_fallback is not None:
+            if cache_fallback is not None and not self._is_static_phantom_track(cache_fallback):
                 session.deliveries.append(cache_fallback)
 
         session.deliveries = self._limit_deliveries(session.deliveries)
@@ -820,6 +918,7 @@ class CricketAnalyticsPipeline:
                                 ball_pixel=ball_pixel,
                                 speed_kmh=active_del.speed["speed_kmh"] if active_del.speed else 0.0,
                                 speed_mph=active_del.speed.get("speed_mph", 0.0) if active_del.speed else 0.0,
+                                speed_reliable=_speed_is_reliable(active_del.speed),
                                 swing_deg=swing_cm,
                                 spin_rpm=drift_angle_deg,
                                 swing_label=active_del.swing["direction"] if active_del.swing else "none",
@@ -1890,6 +1989,29 @@ class CricketAnalyticsPipeline:
                 line=line_value,
                 length=delivery.length or "unknown",
             ))
+
+    @staticmethod
+    def _is_static_phantom_track(delivery: "DeliveryAnalysis") -> bool:
+        """True if a delivery's REAL detections are mostly piled at one pixel.
+
+        A genuine ball moves several pixels every frame; if most non-interpolated
+        points share a tiny pixel bin, the tracker locked onto a fixed background
+        object (net pole, light, painted mark). Interpolation can still stretch a
+        fake vertical span across such a track, so this guards the delivery
+        scorer/limiter which would otherwise accept it."""
+        pts = (delivery.track or {}).get("points") or []
+        real = [p for p in pts if not p.get("is_interpolated", False)]
+        n = len(real)
+        if n < 5:
+            return False
+        from collections import Counter
+        bins = Counter(
+            (int(float(p.get("x", 0.0))) // 8, int(float(p.get("y", 0.0))) // 8)
+            for p in real
+        )
+        dominant = max(bins.values())
+        # >=60% of real points (min 6) co-located => static phantom.
+        return dominant >= max(6, int(round(0.60 * n)))
 
     @staticmethod
     def _trim_to_best_detection_cluster(
@@ -4653,6 +4775,60 @@ if __name__ == "__main__":
                         help="Enable LK optical-flow inside missed-detection gaps (enhanced mode)")
     parser.add_argument("--optical-flow-max-gap-frames", type=int, default=12,
                         help="Largest detection gap to support with bounded optical flow")
+    parser.add_argument("--rts-smooth", action="store_true",
+                        help="Opt-in: offline RTS backward smoothing of the finalized "
+                             "track (removes jitter, stabilises coasted gaps). Default off.")
+    parser.add_argument("--rts-process-noise", type=float, default=2.0,
+                        help="RTS accel process noise: lower=stiffer/smoother arc, "
+                             "higher=tracks sharp changes (bounce). Default 2.0")
+    parser.add_argument("--rts-measurement-noise", type=float, default=6.0,
+                        help="RTS per-detection position noise (px): higher=more smoothing. Default 6.0")
+    parser.add_argument("--optical-flow-fb-check", action="store_true",
+                        help="Opt-in: forward-backward consistency check on the LK optical-flow "
+                             "fallback (rejects silent drift on blurred balls). Default off.")
+    parser.add_argument("--projectile-fit", action="store_true",
+                        help="Opt-in: fit projectile motion (parabola split at bounce) through "
+                             "real detections so the release->bat path is physically exact and "
+                             "blurred/missed frames are reconstructed on the true arc. Default off.")
+    parser.add_argument("--projectile-blend", type=float, default=0.85,
+                        help="How strongly real detections snap to the physics curve "
+                             "(1.0=fully on curve, 0.0=keep raw). Default 0.85")
+    parser.add_argument("--projectile-max-residual", type=float, default=26.0,
+                        help="Reject the physics fit if its RMS error on real detections exceeds "
+                             "this many px (safety). Default 26.0")
+    parser.add_argument("--max-recall", action="store_true",
+                        help="Preset for maximum detection density: 1280px, conf 0.10, NO "
+                             "enhanced-detection (its dynamic-conf/ROI suppress weak balls), "
+                             "byte-track + optical-flow + temporal-recovery + RTS + projectile fit. "
+                             "Measured best real-world tracking config.")
+    parser.add_argument("--temporal-recovery", action="store_true",
+                        help="Opt-in: recover weak-but-real ball detections on the predicted "
+                             "motion path that the confidence gate would drop (motion-validated, "
+                             "raises detection density). Default off.")
+    parser.add_argument("--recovery-conf-floor", type=float, default=0.015,
+                        help="Lowest YOLO confidence eligible for temporal recovery. Default 0.015")
+    parser.add_argument("--recovery-radius-scale", type=float, default=1.4,
+                        help="Multiplier on the low-conf radius for recovery search. Default 1.4")
+    parser.add_argument("--release-corridor", action="store_true",
+                        help="Opt-in: adaptive RELEASE search corridor. In the early post-release "
+                             "window, accept weak detections inside a velocity-aligned corridor "
+                             "(long along motion, narrow perpendicular) — reaches the tiny fast "
+                             "release ball without admitting lateral phantoms. Default off.")
+    parser.add_argument("--release-corridor-frames", type=int, default=12,
+                        help="Frames after first detection treated as the release window. Default 12")
+    parser.add_argument("--release-corridor-long", type=float, default=2.4,
+                        help="Corridor reach ALONG motion (x low-conf radius). Default 2.4")
+    parser.add_argument("--release-corridor-lat", type=float, default=0.55,
+                        help="Corridor half-width PERPENDICULAR to motion (x low-conf radius). Default 0.55")
+    parser.add_argument("--release-mht", action="store_true",
+                        help="Opt-in: multi-hypothesis release tracker. During the release window, "
+                             "accumulate evidence over 2-5 motion-consistent hypotheses and rescue a "
+                             "real detection the single-state associator dropped when one hypothesis "
+                             "is clearly dominant. Never invents detections. Default off.")
+    parser.add_argument("--physics-bridge", action="store_true",
+                        help="Opt-in: fill lost-detection frames between real detections with "
+                             "projectile motion + bounce restitution (hard-coded laws of motion). "
+                             "Bridges gaps; capped short extrapolation past the last detection.")
     parser.add_argument("--calibration", default=None,
                         help="Path to saved .npz calibration file")
     parser.add_argument("--no-video",    action="store_true",
@@ -4702,6 +4878,27 @@ if __name__ == "__main__":
         args.inference_imgsz = max(int(args.inference_imgsz), 1280)
         if args.max_missing_frames == 12:
             args.max_missing_frames = 18
+
+    # --max-recall: the measured best config for detection density. Crucially it
+    # does NOT enable --enhanced-detection, whose dynamic-confidence + ROI search
+    # were found to suppress weak ball detections (0 deliveries on hard clips).
+    # It also deliberately does NOT enable aggressive coast/optical-flow/byte
+    # settings: those were measured to latch the track onto static high-confidence
+    # false positives (e.g. stumps) and FAKE a dense trajectory. We keep only the
+    # safe, real-detection-preserving stack: high-res inference + smoothing +
+    # physics fit + motion-validated temporal recovery (which is guarded against
+    # static locks in the tracker).
+    if bool(getattr(args, "max_recall", False)):
+        args.enhanced_detection = False
+        args.dynamic_conf = False
+        args.roi_detect = False
+        args.tta = False
+        args.inference_imgsz = max(int(args.inference_imgsz), 1280)
+        args.ball_confidence = min(float(args.ball_confidence), 0.10)
+        args.temporal_recovery = True
+        args.rts_smooth = True
+        args.projectile_fit = True
+        args.physics_bridge = True
 
     cfg = PipelineConfig(
         video_path        = args.video,
@@ -4780,6 +4977,22 @@ if __name__ == "__main__":
         has_reference_overlay=bool(getattr(args, "reference_overlay", False)),
         calibration_file  = args.calibration,
         save_video        = not args.no_video,
+        enable_rts_smoothing = bool(getattr(args, "rts_smooth", False)),
+        rts_process_noise = float(getattr(args, "rts_process_noise", 2.0)),
+        rts_measurement_noise = float(getattr(args, "rts_measurement_noise", 6.0)),
+        optical_flow_fb_check = bool(getattr(args, "optical_flow_fb_check", False)),
+        enable_projectile_fit = bool(getattr(args, "projectile_fit", False)),
+        projectile_blend = float(getattr(args, "projectile_blend", 0.85)),
+        projectile_max_residual_px = float(getattr(args, "projectile_max_residual", 26.0)),
+        enable_temporal_recovery = bool(getattr(args, "temporal_recovery", False)),
+        recovery_conf_floor = float(getattr(args, "recovery_conf_floor", 0.015)),
+        recovery_radius_scale = float(getattr(args, "recovery_radius_scale", 1.4)),
+        enable_release_corridor = bool(getattr(args, "release_corridor", False)),
+        release_corridor_frames = int(getattr(args, "release_corridor_frames", 12)),
+        release_corridor_long = float(getattr(args, "release_corridor_long", 2.4)),
+        release_corridor_lat = float(getattr(args, "release_corridor_lat", 0.55)),
+        enable_release_mht = bool(getattr(args, "release_mht", False)),
+        enable_physics_bridge = bool(getattr(args, "physics_bridge", False)),
     )
 
     pl     = CricketAnalyticsPipeline(cfg)

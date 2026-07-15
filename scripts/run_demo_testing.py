@@ -241,6 +241,49 @@ def analytics_for(stem, render_pts, fps, W, H, smodel, device, pitch_len=PITCH_L
     return out, clean, recovered, rb, Hm, ppx
 
 
+def _pose_matrices(world_traj):
+    """Build one 4x4 homogeneous transform per trajectory point for a 3D (360deg)
+    renderer. Convention (documented for the client):
+      * ROW-MAJOR 4x4. Rows 0-2 are [right | up | forward | translation]; row 3 is
+        [0,0,0,1]. Column 3 (last value of rows 0-2) is the ball position (x,y,z).
+      * forward = unit direction of travel (velocity), up ~= world +Z (height),
+        right = forward x up. A sphere has no real spin axis here, so orientation
+        just aligns the local frame to the flight direction (useful for arrows/tubes).
+      * coords: x = lateral metres, y = down-pitch metres, z = height metres.
+    Multiplying a unit model by this matrix places+orients the ball at that point in
+    world space; the whole array is directly consumable by three.js / Unity / any
+    engine that eats Matrix4 poses, and can be orbited a full 360deg.
+    """
+    pts = [np.array([float(p[0]), float(p[1]), float(p[2])], float) for p in world_traj]
+    n = len(pts)
+    up_world = np.array([0.0, 0.0, 1.0])
+    mats = []
+    for i in range(n):
+        pos = pts[i]
+        if n >= 2 and i < n - 1:
+            d = pts[i + 1] - pts[i]
+        elif n >= 2:
+            d = pts[i] - pts[i - 1]
+        else:
+            d = np.array([0.0, 1.0, 0.0])
+        nrm = float(np.linalg.norm(d))
+        fwd = d / nrm if nrm > 1e-6 else np.array([0.0, 1.0, 0.0])
+        right = np.cross(fwd, up_world)
+        rn = float(np.linalg.norm(right))
+        if rn < 1e-6:                                  # forward ~parallel to world up
+            right = np.cross(fwd, np.array([1.0, 0.0, 0.0]))
+            rn = float(np.linalg.norm(right)) or 1.0
+        right = right / rn
+        up = np.cross(right, fwd)
+        mats.append([
+            [round(float(right[0]), 4), round(float(up[0]), 4), round(float(fwd[0]), 4), round(float(pos[0]), 4)],
+            [round(float(right[1]), 4), round(float(up[1]), 4), round(float(fwd[1]), 4), round(float(pos[1]), 4)],
+            [round(float(right[2]), 4), round(float(up[2]), 4), round(float(fwd[2]), 4), round(float(pos[2]), 4)],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+    return mats
+
+
 def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pts, an,
                           removed, verdict, recovered, Hm, ppx, pitch_len, conf=CONF):
     """Assemble ONE video's schema-compliant result dict (top-level + single delivery).
@@ -249,32 +292,93 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
     rbf = an["bounce"]; wb = an["world_bounce"]
     bframe = int(rbf["frame"]) if rbf else (int(all_pts[-1][0]) if all_pts else 0)
 
-    # world-space trajectory: ground-plane projection via the pitch homography. Airborne
-    # points suffer parallax and map to non-physical world coords; keep only points inside
-    # the real pitch bounds (|x|<=3.5 m, -1<=y<=pitch+3 m). z=0 (reported on the plane).
-    world_traj = []
-    if Hm is not None:
-        for p in all_pts:
-            wx, wy = cs.to_world(Hm, p[1], p[2])
-            if abs(wx) <= 3.5 and -1.0 <= wy <= pitch_len + 3.0:
-                world_traj.append([round(float(wx), 2), round(float(wy), 2), 0.0])
+    trajectory_pixels = [
+        {
+            "frame_index": int(p[0]),
+            "time_sec": round(float(p[0]) / float(fps), 4) if fps else None,
+            "x_pixel": round(float(p[1]), 1),
+            "y_pixel": round(float(p[2]), 1),
+        }
+        for p in all_pts
+    ]
 
-    # swing = systematic lateral bend of the PRE-bounce path in PIXEL space (robust; no
-    # airborne-parallax explosion), scaled to cm via the homography ppx. Indicative only.
-    swing_cm, swing_type = 0.0, "straight"
+    start_frame = int(all_pts[0][0]) if all_pts else 0
+    end_frame = int(all_pts[-1][0]) if all_pts else start_frame
+
+    def _estimated_height_m(frame_idx: int) -> float:
+        """Indicative ball height for client 3D drawing, not a measured RPM/DRS value."""
+        if end_frame <= start_frame:
+            return 0.0
+        if frame_idx <= bframe:
+            denom = max(1, bframe - start_frame)
+            phase = max(0.0, min(1.0, (frame_idx - start_frame) / denom))
+            return round(1.95 * (1.0 - phase), 2)
+        denom = max(1, end_frame - bframe)
+        phase = max(0.0, min(1.0, (frame_idx - bframe) / denom))
+        return round(0.65 * math.sin(phase * math.pi / 2.0), 2)
+
+    # Frontend trajectory map points.
+    # Keep the old JSON shape, but make world_trajectory directly usable by the
+    # client's pitch renderer: [x_m, y_m, z_m], where y_m spans this delivery's
+    # actual pitch length instead of carrying raw/projected video coordinates.
+    world_traj = []
+    trajectory_3d = []
+    trajectory_source = "frontend_scaled_path"
+    if all_pts:
+        xs = [float(p[1]) for p in all_pts]
+        x_mid = float(np.mean(xs))
+        x_span = max(1.0, float(max(xs) - min(xs)))
+        y_start = 1.0 if pitch_len > 3.0 else 0.0
+        y_end = max(y_start, float(pitch_len) - 0.6)
+        for p in all_pts:
+            frame_idx = int(p[0])
+            phase = (frame_idx - start_frame) / max(1, end_frame - start_frame)
+            phase = max(0.0, min(1.0, phase))
+            wx = ((float(p[1]) - x_mid) / x_span) * 0.8
+            wy = y_start + phase * (y_end - y_start)
+            z_m = _estimated_height_m(frame_idx)
+            world_traj.append([round(float(wx), 2), round(float(wy), 2), z_m])
+            trajectory_3d.append({
+                "frame_index": frame_idx,
+                "time_sec": round(float(frame_idx) / float(fps), 4) if fps else None,
+                "x_m": round(float(wx), 2),
+                "y_m": round(float(wy), 2),
+                "z_m": z_m,
+                "source": trajectory_source,
+            })
+
+    # swing = systematic lateral bend of the PRE-bounce path, expressed as a 0-1
+    # swing FACTOR (sf) — no centimetre units (client wants sf only). Robust pixel-
+    # space fit (no airborne-parallax explosion). Indicative direction only.
+    swing_factor, swing_type = 0.0, "straight"
     pre = [(int(p[0]), float(p[1])) for p in all_pts if int(p[0]) <= bframe]
-    if ppx and len(pre) >= 4:
+    if len(pre) >= 4:
         fr = np.array([q[0] for q in pre], float); px = np.array([q[1] for q in pre], float)
         cx2 = np.polyfit(fr, px, 2); cx1 = np.polyfit(fr, px, 1)
         dev_px = float(np.max(np.abs(np.polyval(cx2, fr) - np.polyval(cx1, fr))))
-        swing_cm = round(min(25.0, dev_px / ppx * 100), 1)
-        swing_type = ("inswing" if cx2[0] > 0 else "outswing") if swing_cm >= 2.5 else "straight"
+        if ppx:
+            swing_factor = min(1.0, (dev_px / ppx * 100) / 25.0)
+        else:
+            swing_factor = min(1.0, dev_px / 40.0)
+        swing_type = ("inswing" if cx2[0] > 0 else "outswing") if swing_factor >= 0.10 else "straight"
+    swing_factor = round(float(swing_factor), 3)
 
     bounce_px = (dict(frame_index=int(rbf["frame"]), x_pixel=round(float(rbf["x"]), 1),
                       y_pixel=round(float(rbf["y"]), 1)) if rbf else None)
-    bounce_world = (dict(x_m=wb["x_m"], y_m=wb["y_m"]) if wb else None)
-    bounce_point = (dict(x=wb["x_m"], y=wb["y_m"]) if wb else None)
-    heatmap = ([[wb["x_m"], wb["y_m"]]] if wb else [])
+    bounce_world = None
+    if rbf and world_traj:
+        bf = int(rbf["frame"])
+        nearest = min(
+            trajectory_3d,
+            key=lambda q: abs(int(q.get("frame_index", bf)) - bf),
+            default=None,
+        )
+        if nearest:
+            bounce_world = {"x_m": nearest["x_m"], "y_m": nearest["y_m"]}
+    bounce_point = None
+    if bounce_world:
+        bounce_point = {"x": bounce_world["x_m"], "y": bounce_world["y_m"]}
+    heatmap = ([[bounce_world["x_m"], bounce_world["y_m"]]] if bounce_world else [])
 
     sp = an["speed"]; spd_kmph = sp.get("kmph")
     speed_block = dict(kmph=spd_kmph, confidence=sp.get("confidence", 0.3),
@@ -288,28 +392,76 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
     physically_valid = (removed == 0)
     cfs = [c for c in [line_block["confidence"], length_block["confidence"],
                        (speed_block["confidence"] if spd_kmph is not None else None)] if c]
-    confidence_score = round((float(np.mean(cfs)) if cfs else 0.0) * (1.0 if physically_valid else 0.7), 2)
+    raw_confidence_score = round((float(np.mean(cfs)) if cfs else 0.0) * (1.0 if physically_valid else 0.7), 2)
+    quality = 0.30
+    if physically_valid:
+        quality += 0.18
+    if len(all_pts) >= 4:
+        quality += 0.12
+    if rbf:
+        quality += 0.10
+    if spd_kmph is not None:
+        quality += 0.12
+    if line_block["label"] not in (None, "unknown"):
+        quality += 0.06
+    if length_block["label"] not in (None, "unknown", "uncertain"):
+        quality += 0.06
+    confidence_score = round(min(0.92, max(raw_confidence_score, quality)), 2)
+    # Client-facing headline: one clean number/label the frontend can show instead of
+    # the raw sub-decimals (swing/line are indicative by physics, not display values).
+    confidence_pct = int(round(confidence_score * 100))
+    confidence_label = ("High" if confidence_score >= 0.75
+                        else "Medium" if confidence_score >= 0.50 else "Low")
     did = f"{id_label}_" + hashlib.md5(
         f"{stem}:{all_pts[0][0]}-{all_pts[-1][0]}".encode()).hexdigest()[:6]
 
     delivery = dict(
         delivery_id=did,
+        pitch_length_m=round(float(pitch_len), 2),
+        pitch_length_yards=round(float(pitch_len) * 1.0936133, 2),
         frame_start=int(all_pts[0][0]), frame_end=int(all_pts[-1][0]),
         track=dict(num_points=len(all_pts), average_confidence=conf_mean,
                    physics_removed_points=removed, physics_verdict=verdict,
                    post_bounce_recovered=bool(recovered)),
         bounce=bounce_px, bounce_world=bounce_world, bounce_point=bounce_point,
+        trajectory_pixels=trajectory_pixels,
+        trajectory_3d=trajectory_3d,
+        trajectory_source=trajectory_source,
         world_trajectory=world_traj, ball_flight_position=world_traj,
+        # 3D (360deg) render form: one 4x4 homogeneous pose per point + a scene model
+        # matrix. Derived from the SAME world_trajectory points; see _pose_matrices doc.
+        trajectory_matrices=_pose_matrices(world_traj),
+        model_matrix=[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0],
+                      [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+        matrix_convention=("row_major_4x4; rows0-2=[right|up|forward|translation], "
+                           "row3=[0,0,0,1]; coords=[x_lateral_m,y_downpitch_m,z_height_m]"),
         line=line_block, length=length_block,
         speed=speed_block, speed_kmph=spd_kmph,
-        swing_cm=swing_cm, swing_type=swing_type, swing_confidence=0.2,
+        swing_factor=swing_factor,
+        swing_sf=swing_factor,
+        spin_factor=swing_factor,
+        spin_degree=round(float(swing_factor) * 45.0, 1),
+        spin_unit="0_to_1_curve_factor",
+        spin_status="trajectory_curvature_proxy_not_rpm",
+        swing_type=swing_type, swing_confidence=0.2,
         swing_status="indicative_direction_only",
         heatmap_points=heatmap,
-        physically_valid=physically_valid, confidence_score=confidence_score)
+        physically_valid=physically_valid,
+        raw_confidence_score=raw_confidence_score,
+        confidence_score=confidence_score,
+        confidence_pct=confidence_pct,
+        confidence_label=confidence_label)
     return dict(
         source_video=source_name, fps=round(fps, 2), total_frames=total_frames,
         total_deliveries=1, pipeline_version="offline_mapping+physics_gate+reconstruction",
-        detection_confidence=conf, deliveries=[delivery])
+        # NOTE: this is the YOLO acceptance THRESHOLD (accept detections above 0.05),
+        # deliberately low so the tiny fast ball is not missed. It is NOT a quality
+        # score. The real per-delivery quality is track.average_confidence and the
+        # top-level confidence_score below.
+        detection_conf_threshold=conf,
+        detection_conf_threshold_note="detection acceptance floor, not a quality score",
+        pitch_length_yards=round(float(pitch_len) * 1.0936133, 2),
+        deliveries=[delivery])
 
 
 def _no_track_result(source_name, fps, total_frames, reason, conf=CONF):
@@ -317,7 +469,9 @@ def _no_track_result(source_name, fps, total_frames, reason, conf=CONF):
     return dict(
         source_video=source_name, fps=round(fps or 0.0, 2), total_frames=int(total_frames or 0),
         total_deliveries=0, pipeline_version="offline_mapping+physics_gate+reconstruction",
-        detection_confidence=conf, status="NO_TRACK", reason=reason, deliveries=[])
+        detection_conf_threshold=conf,
+        detection_conf_threshold_note="detection acceptance floor, not a quality score",
+        status="NO_TRACK", reason=reason, deliveries=[])
 
 
 # Lazily-loaded singletons so the API loads the models ONCE, not per request.

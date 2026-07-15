@@ -159,7 +159,10 @@ class PipelineConfig:
     pitch_length_m:     float = PITCH_LENGTH_M_DEFAULT
     clean_video_mode:   bool  = True
     use_enhanced_detection: bool = False
-    inference_imgsz:    int   = 640
+    # 1280 (not 640) — matches the single-video engine. The ball is only a few
+    # pixels wide; at 640 the small/fast ball is simply not resolvable and the
+    # track starts late / ends early.
+    inference_imgsz:    int   = 1280
     enable_tta:         bool  = False
     enable_roi_detect:  bool  = False
     dynamic_confidence: bool  = False

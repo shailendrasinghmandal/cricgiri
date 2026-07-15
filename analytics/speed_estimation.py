@@ -140,10 +140,15 @@ class SpeedEstimator:
                 speed_kmh = speed_ms * 3.6
                 speed_mph = speed_kmh * 0.621371
 
+                # Apply the calibration multiplier BEFORE the realism band, so the
+                # PUBLISHED value is what gets sanity-checked. (Checking first and
+                # scaling after let a multiplier publish e.g. 167 km/h — above the
+                # 165 max and faster than the world record.)
+                speed_kmh *= self.speed_multiplier
+                speed_mph *= self.speed_multiplier
+                speed_ms *= self.speed_multiplier
+
                 if MIN_SPEED_KMH <= speed_kmh <= MAX_SPEED_KMH:
-                    speed_kmh *= self.speed_multiplier
-                    speed_mph *= self.speed_multiplier
-                    speed_ms *= self.speed_multiplier
 
                     logger.info(
                         "Speed (physics_tof): %.1f km/h | dist=%.2fm | dur=%.3fs | frames=%d",
@@ -203,6 +208,12 @@ class SpeedEstimator:
         speed_mph = speed_kmh * 0.621371
         method = "arc_length"
 
+        # Calibration multiplier applied BEFORE the realism gate below, so the gate
+        # gates the value we actually publish (see the same fix in Method 1).
+        speed_kmh *= self.speed_multiplier
+        speed_mph *= self.speed_multiplier
+        speed_ms *= self.speed_multiplier
+
         # Hard sanity gate: if the computation produces a speed clearly outside
         # realistic cricket bowling (≥ MAX_SPEED_KMH or < MIN_SPEED_KMH), the
         # underlying distance/duration is unreliable — usually a homography
@@ -224,10 +235,7 @@ class SpeedEstimator:
             )
             return None
 
-        # Apply calibration multiplier
-        speed_kmh *= self.speed_multiplier
-        speed_mph *= self.speed_multiplier
-        speed_ms *= self.speed_multiplier
+        # (calibration multiplier already applied above, before the realism gate)
 
         # Confidence based on method and number of frames
         frame_factor = min(1.0, frames_used / self.release_frames)

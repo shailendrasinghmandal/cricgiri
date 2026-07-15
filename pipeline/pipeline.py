@@ -287,6 +287,32 @@ class PipelineConfig:
 # (same schema the single-video engine, scripts/run_demo_testing.py, emits).
 # ---------------------------------------------------------------------------
 
+# The ONLY length labels the response may contain. The internal classifier has
+# finer buckets (full_toss / short_of_good / bouncer ...); they are collapsed onto
+# these four so the client never sees a label outside the agreed set.
+# "bouncer" in particular must never be published.
+LENGTH_LABELS = ("yorker", "full_length", "good_length", "short_length")
+_LENGTH_MAP = {
+    "yorker":        "yorker",
+    "full_toss":     "full_length",     # overpitched -> full
+    "full":          "full_length",
+    "full_length":   "full_length",
+    "good_length":   "good_length",
+    "short_of_good": "short_length",    # back of a length -> short
+    "short":         "short_length",
+    "short_length":  "short_length",
+    "bouncer":       "short_length",    # pitched short -> short
+}
+
+
+def normalise_length(label: Optional[str]) -> str:
+    """Collapse the internal length buckets onto the four published labels."""
+    if not label:
+        return "unknown"
+    key = str(label).strip().lower()
+    return _LENGTH_MAP.get(key, "unknown")
+
+
 _MATRIX_CONVENTION = ("row_major_4x4; rows0-2=[right|up|forward|translation], "
                       "row3=[0,0,0,1]; coords=[x_lateral_m,y_downpitch_m,z_height_m]")
 _IDENTITY_4X4 = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0],
@@ -445,14 +471,18 @@ class DeliveryAnalysis:
         dist_bat = None
         if bounce_world is not None:
             dist_bat = round(max(0.0, pitch_len - float(bounce_world["y_m"])), 2)
-        length_block = {"label": self.length or "unknown",
-                        "confidence": 0.83 if self.length else 0.0,
+        length_label = normalise_length(self.length)
+        length_block = {"label": length_label,
+                        "confidence": 0.83 if length_label != "unknown" else 0.0,
                         "distance_from_batsman_m": dist_bat}
 
         # ── swing / spin: factors (0-1), not centimetres ───────────────
         swing_cm = float(self.swing["swing_cm"]) if self.swing else 0.0
         swing_factor = round(min(1.0, swing_cm / 25.0), 3)
-        swing_type = self.swing["direction"] if self.swing else "straight"
+        # Documented enum is inswing / outswing / straight — the tracker's internal
+        # "none" is not a valid response value.
+        _dir = str((self.swing or {}).get("direction", "straight"))
+        swing_type = _dir if _dir in ("inswing", "outswing") else "straight"
 
         # ── confidence ─────────────────────────────────────────────────
         physically_valid = bool((self.track or {}).get("physics_verdict", "valid") == "valid")

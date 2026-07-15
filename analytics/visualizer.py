@@ -999,22 +999,27 @@ def draw_fulltrack_hud(
 
     cards = []
 
-    # Card 1: Swing
+    # Every card must print the SAME number the JSON response carries for this
+    # delivery — a viewer comparing the video to the API output must not see two
+    # different values. Rounding here therefore matches the JSON's rounding:
+    #   swing_sf     3dp   spin_degree  1dp   speed_kmph   1dp
+
+    # Card 1: Swing — 0-1 factor (swing_sf), NOT centimetres.
     swing_val = vis.swing_deg
-    swing_str = f"{swing_val:.1f}" if swing_val > 0 else "0.0"
+    swing_str = f"{swing_val:.3f}" if swing_val > 0 else "0.000"
     cards.append(("Swing", swing_str, "sf"))
 
-    # Card 2: Spin (turn angle in degrees, per PDF: drift/turn estimation)
+    # Card 2: Spin — curvature proxy in degrees (spin_degree), not RPM.
     spin_val = vis.spin_rpm
     spin_str = f"{spin_val:.1f}" if spin_val > 0 else "0.0"
-    cards.append(("Drift", spin_str, "deg"))  # drift/turn angle in degrees (per PDF)
+    cards.append(("Drift", spin_str, "deg"))
 
     # Card 3: Speed — only show a number when it is a real measurement.
     # A low-confidence "prior" (e.g. the 110 km/h fallback) must NOT be shown as
     # if it were measured, so it renders as "~est" instead of a misleading value.
     speed_val = vis.speed_kmh
     if speed_val > 0 and vis.speed_reliable:
-        speed_str = f"{int(speed_val)}"
+        speed_str = f"{speed_val:.1f}"
     elif speed_val > 0:
         speed_str = "~est"
     else:

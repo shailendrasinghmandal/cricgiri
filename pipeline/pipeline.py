@@ -133,11 +133,16 @@ class PipelineConfig:
     output_video_path:  str  = "outputs/output_annotated.mp4"
     output_json_path:   str  = "outputs/analysis_result.json"
 
-    # Model paths (relative to project root; override via env vars on AWS)
+    # Model paths (relative to project root; override via env vars on AWS).
+    # Defaults mirror the single-video engine (scripts/run_demo_testing.py): the
+    # ball_ft_t4 + ball_best_leather_new ENSEMBLE at conf 0.05. The 2nd model lifts
+    # recall on blurred/low-contrast frames — with the primary alone the track is
+    # much shorter and the release->bounce speed collapses (measured on the same
+    # clip: 8 pts / 67.9 km/h single vs 17 pts / 137.2 km/h ensemble).
     stump_model_path:   str  = "models/stump_best.pt"
-    ball_model_path:    str  = "models/ball_best.pt"
-    ball_model_alt_path: Optional[str] = None
-    hybrid_ensemble: bool = False
+    ball_model_path:    str  = "models/ball_ft_t4.pt"
+    ball_model_alt_path: Optional[str] = "models/ball_best_leather_new.pt"
+    hybrid_ensemble: bool = True
     auto_hybrid_on_overlay: bool = True
     adaptive_multi_model: bool = False
     adaptive_model_paths: Optional[List[str]] = None
@@ -146,7 +151,9 @@ class PipelineConfig:
 
     # Detection — legacy path (test_video8_tuned) is default; enhanced is opt-in
     stump_confidence:   float = 0.30
-    ball_confidence:    float = 0.10
+    # LOW floor = high recall on the small, fast ball (matches the single-video
+    # engine). This is an acceptance threshold, not a quality score.
+    ball_confidence:    float = 0.05
     # Real stump-to-stump pitch length (metres). Scales every world/down-pitch
     # value in the response; send the actual length of the footage for correct numbers.
     pitch_length_m:     float = PITCH_LENGTH_M_DEFAULT

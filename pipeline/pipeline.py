@@ -287,6 +287,31 @@ class PipelineConfig:
 # (same schema the single-video engine, scripts/run_demo_testing.py, emits).
 # ---------------------------------------------------------------------------
 
+# The ONLY line labels the response may contain (same set the single-video engine
+# publishes). The internal BowlingLine enum uses different spellings.
+LINE_LABELS = ("wide_off", "outside_off", "off_stump", "middle_stump",
+               "leg_stump", "down_leg", "wide_leg")
+_LINE_MAP = {
+    "wide_outside_off": "wide_off",
+    "wide_off":         "wide_off",
+    "outside_off":      "outside_off",
+    "off_stump":        "off_stump",
+    "middle_stump":     "middle_stump",
+    "leg_stump":        "leg_stump",
+    "outside_leg":      "down_leg",
+    "down_leg":         "down_leg",
+    "wide_outside_leg": "wide_leg",
+    "wide_leg":         "wide_leg",
+}
+
+
+def normalise_line(label: Optional[str]) -> str:
+    """Map the internal BowlingLine spellings onto the published line labels."""
+    if not label:
+        return "unknown"
+    return _LINE_MAP.get(str(label).strip().lower(), "unknown")
+
+
 # The ONLY length labels the response may contain. The internal classifier has
 # finer buckets (full_toss / short_of_good / bouncer ...); they are collapsed onto
 # these four so the client never sees a label outside the agreed set.
@@ -317,6 +342,55 @@ _MATRIX_CONVENTION = ("row_major_4x4; rows0-2=[right|up|forward|translation], "
                       "row3=[0,0,0,1]; coords=[x_lateral_m,y_downpitch_m,z_height_m]")
 _IDENTITY_4X4 = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0],
                  [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+
+
+def _load_physics_gate():
+    """scripts/physics_gate_v2.py is not an importable package — load it by path.
+    Returns physics_filter(pts) -> (filtered, removed, verdict, reasons), or None."""
+    try:
+        import importlib.util
+        p = Path(__file__).resolve().parents[1] / "scripts" / "physics_gate_v2.py"
+        if not p.exists():
+            return None
+        spec = importlib.util.spec_from_file_location("_pg_v2", p)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m.physics_filter
+    except Exception:                                            # noqa: BLE001
+        logger.warning("physics gate unavailable; physics fields will be defaults",
+                       exc_info=True)
+        return None
+
+
+_PHYSICS_FILTER = _load_physics_gate()
+
+# Release guard: a delivery cannot teleport. A couple of points separated from the
+# body of the track by a long temporal gap are detections of something else
+# (ground truth on clip01: the track opened at f46-48 in empty sky while the ball
+# only appears at f54). They matter because speed is measured release->bounce, so
+# a false release point silently inflates speed.
+RELEASE_GUARD_MIN_GAP = 6      # frames of silence that separate an orphan group
+RELEASE_GUARD_MAX_ORPHAN = 3   # at most this many leading points may be dropped
+
+
+def release_guard(pts: List[tuple]) -> Tuple[List[tuple], List[int]]:
+    """Drop leading points that are cut off from the main track by a long gap.
+
+    `pts` are (frame, x, y, conf) sorted by frame. Conservative by design: only a
+    SMALL leading group, separated by a LONG gap, with a clearly longer track
+    remaining, is dropped. Returns (kept, dropped_frames).
+    """
+    if len(pts) < 4:
+        return pts, []
+    for i in range(1, len(pts)):
+        gap = int(pts[i][0]) - int(pts[i - 1][0])
+        if gap < RELEASE_GUARD_MIN_GAP:
+            continue
+        # points before the gap are candidate orphans
+        if i <= RELEASE_GUARD_MAX_ORPHAN and len(pts) - i >= 2 * i:
+            return pts[i:], [int(p[0]) for p in pts[:i]]
+        break          # first gap is not an orphan split -> keep the track intact
+    return pts, []
 
 
 def _pose_matrices(world_traj: List[List[float]]) -> List[List[List[float]]]:
@@ -397,7 +471,29 @@ class DeliveryAnalysis:
         fps_v = float(fps or self.fps or 30.0)
         pitch_len = float(pitch_length_m or self.pitch_length_m or PITCH_LENGTH_M_DEFAULT)
 
-        pts = list((self.track or {}).get("points") or [])
+        # ── clean the track: release guard, then the physics-validity gate ──
+        # Both engines must agree, so this mirrors run_demo_testing: the gate
+        # decides physics_verdict / physics_removed_points / physically_valid
+        # instead of them being static placeholders.
+        raw = sorted(
+            [(int(p["frame_idx"]), float(p["x"]), float(p["y"]),
+              float(p.get("confidence", 0.0)))
+             for p in ((self.track or {}).get("points") or [])],
+            key=lambda t: t[0],
+        )
+        guarded, dropped_frames = release_guard(raw)
+        if dropped_frames:
+            logger.info("release guard dropped orphan point(s) at frames %s", dropped_frames)
+        if _PHYSICS_FILTER is not None and len(guarded) >= 4:
+            kept, removed_n, verdict, reasons = _PHYSICS_FILTER(guarded)
+            if reasons:
+                logger.info("physics gate removed %d point(s): %s", removed_n, reasons)
+        else:
+            kept, removed_n, verdict = guarded, 0, ("valid" if guarded else "too_few")
+        # Orphans dropped by the release guard count as physics removals too.
+        removed_n = int(removed_n) + len(dropped_frames)
+
+        pts = [{"frame_idx": t[0], "x": t[1], "y": t[2], "confidence": t[3]} for t in kept]
         start_frame = int(pts[0]["frame_idx"]) if pts else int(self.frame_start)
         end_frame = int(pts[-1]["frame_idx"]) if pts else int(self.frame_end)
         bframe = end_frame
@@ -465,8 +561,9 @@ class DeliveryAnalysis:
             "confidence": 0.85 if _speed_is_reliable(self.speed) else 0.3,
             "status": "estimated" if spd_kmph else "unavailable",
         }
-        line_block = {"label": self.line or "unknown",
-                      "confidence": 0.45 if self.line else 0.0,
+        line_label = normalise_line(self.line)
+        line_block = {"label": line_label,
+                      "confidence": 0.45 if line_label != "unknown" else 0.0,
                       "reliability": "indicative"}
         dist_bat = None
         if bounce_world is not None:
@@ -485,7 +582,9 @@ class DeliveryAnalysis:
         swing_type = _dir if _dir in ("inswing", "outswing") else "straight"
 
         # ── confidence ─────────────────────────────────────────────────
-        physically_valid = bool((self.track or {}).get("physics_verdict", "valid") == "valid")
+        # Real gate output (see above), not a placeholder: a clean arc removes
+        # nothing. Matches the single-video engine's definition.
+        physically_valid = (removed_n == 0)
         raw_confidence_score = round(float(self.confidence), 2)
         quality = 0.30
         if physically_valid:
@@ -515,10 +614,17 @@ class DeliveryAnalysis:
             "bat_impact_frame": self.bat_impact_frame,
             "track": {
                 "num_points": len(pts),
-                "average_confidence": round(float((self.track or {}).get("confidence_mean", 0.0)), 3),
-                "physics_removed_points": int((self.track or {}).get("physics_removed_points", 0)),
-                "physics_verdict": str((self.track or {}).get("physics_verdict", "valid")),
-                "post_bounce_recovered": bool((self.track or {}).get("post_bounce_recovered", False)),
+                # Mean YOLO confidence of the DETECTED points. Interpolated points
+                # carry conf 0 and are excluded — they are not detections, and
+                # averaging them in understates real detection quality.
+                "average_confidence": round(
+                    float(np.mean(_det_confs)) if (_det_confs := [
+                        p["confidence"] for p in pts if p["confidence"] > 0.0]) else 0.0, 3),
+                "physics_removed_points": removed_n,
+                "physics_verdict": str(verdict),
+                # True when real ball points were tracked past the bounce.
+                "post_bounce_recovered": bool(
+                    bframe is not None and any(int(p["frame_idx"]) > bframe for p in pts)),
             },
             "bounce": bounce_px,
             "bounce_world": bounce_world,

@@ -121,7 +121,8 @@ foreach ($m in @("ball_ft_t4.pt", "ball_best_leather_new.pt", "stump_best.pt")) 
 # --- Runner + docs + requirements -------------------------------------------
 Copy-Item (Join-Path $Root "run_pipeline.py") $Stage -Force
 Write-Host "  copy  run_pipeline.py"
-foreach ($f in @("deploy\PIPELINE_SETUP.md", "docs\DELIVERY_API_RESPONSE_FORMAT.md")) {
+foreach ($f in @("deploy\PIPELINE_SETUP.md", "docs\DELIVERY_API_RESPONSE_FORMAT.md",
+                 "docs\PIPELINE_PACKAGE_REFERENCE.md")) {
     $p = Join-Path $Root $f
     if (Test-Path $p) {
         Copy-Item $p (Join-Path $Stage (Split-Path $f -Leaf)) -Force
@@ -153,6 +154,15 @@ websockets>=12.0
 # scikit-image
 "@ | Set-Content -Path (Join-Path $Stage "requirements.txt") -Encoding ascii
 Write-Host "  write requirements.txt"
+
+# The engineering-reference PDF (rendered from docs/PIPELINE_PACKAGE_REFERENCE.md).
+$pdf = Join-Path (Split-Path $Root -Parent) "CricGiri_Pipeline_Package_Reference.pdf"
+if (Test-Path $pdf) {
+    Copy-Item $pdf $Stage -Force
+    Write-Host "  copy  CricGiri_Pipeline_Package_Reference.pdf"
+} else {
+    Write-Host "  WARN  reference PDF not found at $pdf - shipping markdown only"
+}
 
 # Runtime scratch dirs so first run never fails on a missing folder.
 foreach ($d in @("outputs", "videos", "logs")) {

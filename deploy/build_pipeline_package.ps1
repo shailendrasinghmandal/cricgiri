@@ -35,6 +35,61 @@ foreach ($d in @("pipeline", "analytics", "tracking", "config")) {
 Write-Host "  copy  scripts\  (physics_gate_v2 + delivery_reconstruction are REQUIRED)"
 Copy-Item (Join-Path $Root "scripts") (Join-Path $Stage "scripts") -Recurse -Force
 
+# --- HTTP API (+ backend webhook) -------------------------------------------
+# Ships as api/delivery_api.py — the SAME module path the backend/Dockerfile
+# already use ("uvicorn api.delivery_api:app --port 7860"), so this package is a
+# drop-in replacement for the previously delivered zip. In the repo the file is
+# api/pipeline_api.py so it does not collide with the older script-engine API of
+# that name; only the pipeline-driven one is shipped.
+$ApiDst = Join-Path $Stage "api"
+New-Item -ItemType Directory -Path $ApiDst -Force | Out-Null
+$apiSrc = Join-Path $Root "api\pipeline_api.py"
+if (-not (Test-Path $apiSrc)) { throw "MISSING REQUIRED API FILE: $apiSrc" }
+Write-Host "  copy  api\pipeline_api.py -> api\delivery_api.py  (drop-in module path)"
+Copy-Item $apiSrc (Join-Path $ApiDst "delivery_api.py") -Force
+$initSrc = Join-Path $Root "api\__init__.py"
+if (-not (Test-Path $initSrc)) { throw "MISSING REQUIRED API FILE: $initSrc" }
+Copy-Item $initSrc (Join-Path $ApiDst "__init__.py") -Force
+Write-Host "  copy  api\__init__.py"
+
+# --- Dockerfile : same CMD/port as the deployed image ------------------------
+@"
+# CricGiri pipeline analytics API — production container.
+# Same entrypoint/port as the previously deployed image, so this is a drop-in.
+FROM python:3.11-slim-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 user
+ENV HOME=/home/user PATH=/home/user/.local/bin:`$PATH
+WORKDIR /app
+
+# CPU-only torch by default; for a GPU host swap the index-url for cu126.
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+    torch torchvision
+
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+RUN mkdir -p uploads outputs videos logs && chown -R user:user /app
+USER user
+
+ENV PYTHONUNBUFFERED=1 \
+    CRICGIRI_WEBHOOK_URL=https://aistg.cricgiri.com/webhook/session-clip \
+    MAX_UPLOAD_MB=200
+
+EXPOSE 7860
+
+# Single worker: the YOLO models are shared singletons, inference is serialised,
+# and the in-memory /status job store is process-local (relies on --workers 1).
+CMD ["uvicorn", "api.delivery_api:app", "--host", "0.0.0.0", "--port", "7860", \
+     "--workers", "1", "--timeout-keep-alive", "300"]
+"@ | Set-Content -Path (Join-Path $Stage "Dockerfile") -Encoding ascii
+Write-Host "  write Dockerfile  (uvicorn api.delivery_api:app --port 7860)"
+
 # --- Root-level modules imported by the package -----------------------------
 # pipeline.py does `from ball_label_utils import ...` — a top-level module that
 # lives at the project root, not inside a package dir. Missing it is a hard
@@ -84,6 +139,18 @@ numpy
 scipy
 filterpy
 PyYAML
+
+# HTTP API + backend webhook (api/pipeline_api.py)
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+requests>=2.31.0
+websockets>=12.0
+
+# OPTIONAL — only needed if you enable PipelineConfig(use_enhanced_detection=True).
+# analytics/ball_enhancement.py imports skimage lazily (inside the function), so
+# the default pipeline runs fine without it. Uncomment if you turn that path on.
+# scikit-image
 "@ | Set-Content -Path (Join-Path $Stage "requirements.txt") -Encoding ascii
 Write-Host "  write requirements.txt"
 

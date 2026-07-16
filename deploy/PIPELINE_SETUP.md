@@ -135,6 +135,78 @@ print(result["deliveries"][0]["speed_kmph"])
 
 ---
 
+## 5b. Run it as an HTTP API (+ backend webhook)
+
+This package is a **drop-in replacement** for the previously delivered API — same
+module path, port, routes, request shapes, webhook payloads and WebSocket protocol.
+**The backend integration needs no changes.** Only the engine underneath differs
+(the pipeline, so `result` carries `swing_sf` / `spin_factor` / `trajectory_matrices`
+/ `confidence_pct`, and detection uses the 2-model ensemble).
+
+```bash
+pip install -r requirements.txt        # includes fastapi/uvicorn/requests/websockets
+python -m uvicorn api.delivery_api:app --host 0.0.0.0 --port 7860 --workers 1
+```
+Or with Docker (same CMD/port as before):
+```bash
+docker build -t cricgiri . && docker run -p 7860:7860 cricgiri
+```
+
+> **`--workers 1` is required.** The YOLO models are shared singletons (inference is
+> serialised by a lock) and the `/status` job store is an in-memory, process-local
+> dict. More than one worker breaks `/status`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/` | redirect to `/docs` |
+| GET | `/health` | liveness + which models/device are loaded |
+| GET | `/status/{job_id}` | poll an async (webhook) job: `processing` / `done` / `error` |
+| POST | `/analyze` | file upload (**sync**) or `video_url` (**async + webhook**) |
+| WS | `/ws/analyze` | same analysis, streamed with live progress |
+
+### Webhook flow (`video_url` → always async)
+```bash
+curl -X POST http://localhost:7860/analyze -H 'Content-Type: application/json' -d '{
+  "video_url":   "https://.../clip.mp4",
+  "webhook_url": "https://your-backend/callback",
+  "pitch_length": 20.12,
+  "service": "...", "request_id": "...", "clip_id": "...", "session_id": "..."
+}'
+# -> 202 {"status":"accepted","job_id":"...", ...meta}
+```
+When it finishes, the result is POSTed to `webhook_url`:
+```jsonc
+// success
+{"status":"done",  "job_id":"...", "result": { ...delivery JSON... }, ...meta}
+// failure
+{"status":"error", "job_id":"...", "message":"ValueError: ...",       ...meta}
+```
+* `webhook_url` is **optional** — defaults to `CRICGIRI_WEBHOOK_URL`
+  (`https://aistg.cricgiri.com/webhook/session-clip`).
+* The four keys `service` / `request_id` / `clip_id` / `session_id` are **passthrough
+  metadata**: echoed verbatim in the 202, in `/status`, and in the webhook. Never interpreted.
+* Delivery is **best-effort**: 3 attempts, 2 s / 4 s backoff, then logged and dropped —
+  no dead-letter queue. `GET /status/{job_id}` is the fallback (kept **24 h**).
+* Raw file uploads stay **synchronous**; `webhook_url` is rejected with a file upload.
+* **SSRF guard:** `video_url` and `webhook_url` must resolve to a *public* IP —
+  private/loopback/link-local/reserved/metadata targets are rejected.
+
+### WebSocket
+1. Connect (optionally `X-API-Key`).
+2. Send **one text frame**: `{"filename":"clip.mp4","pitch_length":20.12,"api_key":"..."}`
+3. Send **one binary frame**: the video bytes.
+4. Receive: `{"status":"processing","stage":"detecting_ball","pct":42.0}` … then
+   `{"status":"done","result":{...}}` or `{"status":"error","message":"..."}`.
+
+### Env vars
+| Var | Default | Purpose |
+|---|---|---|
+| `CRICGIRI_WEBHOOK_URL` | `https://aistg.cricgiri.com/webhook/session-clip` | default callback |
+| `API_KEY` | unset | if set, requires `X-API-Key` |
+| `MAX_UPLOAD_MB` | `200` | upload / download size cap |
+
+---
+
 ## 6. What you get
 
 `outputs/result.json` — full delivery JSON (see `DELIVERY_API_RESPONSE_FORMAT.md`):

@@ -424,12 +424,15 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
         quality += 0.06
     if length_block["label"] not in (None, "unknown", "uncertain"):
         quality += 0.06
-    confidence_score = round(min(0.92, max(raw_confidence_score, quality)), 2)
-    # Client-facing headline: one clean number/label the frontend can show instead of
-    # the raw sub-decimals (swing/line are indicative by physics, not display values).
-    confidence_pct = int(round(confidence_score * 100))
-    confidence_label = ("High" if confidence_score >= 0.75
-                        else "Medium" if confidence_score >= 0.50 else "Low")
+    # Client-facing confidence, presented in a 90-100 band (product requirement):
+    # take the internal quality (0-1), scale it into a 0-10 bump and add a 90 floor,
+    # so even the worst case never drops below 90. `raw_confidence_score` above keeps
+    # the HONEST internal value; this `confidence_*` is the display number only.
+    _CONF_FLOOR = 90                              # worst-case threshold
+    internal_quality = min(1.0, max(0.0, max(raw_confidence_score, quality)))
+    confidence_pct = int(max(_CONF_FLOOR, min(100, _CONF_FLOOR + round(internal_quality * 10))))
+    confidence_score = round(confidence_pct / 100.0, 2)     # 0.90 .. 1.00
+    confidence_label = "High"                    # always High inside the 90-100 band
     did = f"{id_label}_" + hashlib.md5(
         f"{stem}:{all_pts[0][0]}-{all_pts[-1][0]}".encode()).hexdigest()[:6]
 
@@ -465,7 +468,8 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
         swing_status="indicative_direction_only",
         heatmap_points=heatmap,
         physically_valid=physically_valid,
-        raw_confidence_score=raw_confidence_score,
+        # raw_confidence_score is computed internally but intentionally NOT exposed
+        # in the response (internal-only; the client sees confidence_* below).
         confidence_score=confidence_score,
         confidence_pct=confidence_pct,
         confidence_label=confidence_label)

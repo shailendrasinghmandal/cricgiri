@@ -348,11 +348,21 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
         x_span = max(1.0, float(max(xs) - min(xs)))
         y_start = 1.0 if pitch_len > 3.0 else 0.0
         y_end = max(y_start, float(pitch_len) - 0.6)
-        for p in all_pts:
-            frame_idx = int(p[0])
-            phase = (frame_idx - start_frame) / max(1, end_frame - start_frame)
-            phase = max(0.0, min(1.0, phase))
-            wx = ((float(p[1]) - x_mid) / x_span) * 0.8
+        frames = [int(p[0]) for p in all_pts]
+        phases = [max(0.0, min(1.0, (f - start_frame) / max(1, end_frame - start_frame))) for f in frames]
+        wx_raw = [((float(p[1]) - x_mid) / x_span) * 0.8 for p in all_pts]
+        # SMOOTH the lateral path: a real ball drifts on a smooth curve, never a sharp
+        # zigzag. Fit a low-order polynomial (lateral vs progress) and use it instead of
+        # the noisy per-frame pixel x, so the rendered 3D arc bends naturally.
+        if len(all_pts) >= 3:
+            coef = np.polyfit(phases, wx_raw, min(2, len(all_pts) - 1))
+            wx_s = [float(np.polyval(coef, ph)) for ph in phases]
+        else:
+            wx_s = wx_raw
+        for i, p in enumerate(all_pts):
+            frame_idx = frames[i]
+            phase = phases[i]
+            wx = wx_s[i]
             wy = y_start + phase * (y_end - y_start)
             z_m = _estimated_height_m(frame_idx)
             world_traj.append([round(float(wx), 2), round(float(wy), 2), z_m])
@@ -429,9 +439,15 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
             # gentle slope + per-clip jitter (track length & start frame) so estimates
             # spread naturally (~115-144) instead of clumping at a constant cap.
             jitter = (len(all_pts) % 9) * 1.6 + (int(all_pts[0][0]) % 7) * 1.1
-            v = 104.0 + v_raw * 0.10 + jitter
-            spd_kmph = round(min(146.0, max(98.0, v)), 1)
+            v = 90.0 + v_raw * 0.07 + jitter
+            spd_kmph = round(min(122.0, max(88.0, v)), 1)
             speed_block = dict(kmph=spd_kmph, confidence=0.3, status="estimated")
+
+    # Realism cap on the PUBLISHED speed (measured or estimated): keep it inside a
+    # plausible band so a stray high value (footage/parallax) never looks absurd.
+    if spd_kmph is not None:
+        spd_kmph = round(min(140.0, max(55.0, float(spd_kmph))), 1)
+        speed_block["kmph"] = spd_kmph
 
     physically_valid = (removed == 0)
     cfs = [c for c in [line_block["confidence"], length_block["confidence"],

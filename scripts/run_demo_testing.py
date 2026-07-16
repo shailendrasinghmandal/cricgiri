@@ -284,6 +284,24 @@ def _pose_matrices(world_traj):
     return mats
 
 
+# The ONLY length labels the response may contain — the classifier has finer
+# buckets (full_toss / short_of_good / bouncer …); collapse them onto these four
+# so the client never sees a label outside the agreed set ("bouncer" in particular).
+_LENGTH_MAP = {
+    "yorker": "yorker", "full_toss": "full_length", "full": "full_length",
+    "full_length": "full_length", "good_length": "good_length",
+    "short_of_good": "short_length", "short": "short_length",
+    "short_length": "short_length", "bouncer": "short_length",
+}
+
+
+def _norm_length(label):
+    """Collapse the internal length buckets onto the four published labels."""
+    if not label:
+        return "unknown"
+    return _LENGTH_MAP.get(str(label).strip().lower(), "unknown")
+
+
 def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pts, an,
                           removed, verdict, recovered, Hm, ppx, pitch_len, conf=CONF):
     """Assemble ONE video's schema-compliant result dict (top-level + single delivery).
@@ -386,7 +404,7 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
     ln = an["line"]; lg = an["length"]
     line_block = dict(label=ln.get("label"), confidence=ln.get("confidence", 0.0),
                       reliability=ln.get("reliability", "indicative"))
-    length_block = dict(label=lg.get("label"), confidence=lg.get("confidence", 0.0),
+    length_block = dict(label=_norm_length(lg.get("label")), confidence=lg.get("confidence", 0.0),
                         distance_from_batsman_m=lg.get("dist_from_batsman_m"))
 
     physically_valid = (removed == 0)

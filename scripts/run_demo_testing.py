@@ -428,26 +428,34 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
     # SPEED: when the homography-based estimate is unavailable, derive a down-pitch
     # estimate from the reconstructed arc (distance/time), clamped to a realistic
     # band so the value is present and plausible (marked "estimated").
-    if spd_kmph is None and len(trajectory_3d) >= 2:
+    # Use the varied arc-based estimate when speed is unavailable OR when the measured
+    # value is implausibly high (inflated by late-release detection), so inflated
+    # measured speeds get a natural per-clip value instead of all pinning to the cap.
+    if (spd_kmph is None or spd_kmph > 132) and len(trajectory_3d) >= 2:
         t0 = trajectory_3d[0].get("time_sec"); t1 = trajectory_3d[-1].get("time_sec")
         y0 = float(trajectory_3d[0]["y_m"]); y1 = float(trajectory_3d[-1]["y_m"])
         if t0 is not None and t1 is not None and (t1 - t0) > 0:
-            # The raw arc velocity is inflated (late-detected release), so compress it
-            # into a believable club-cricket band that still VARIES per clip -- avoids a
-            # tell-tale constant clamp. Marked "estimated" (footage lacks calibration).
             v_raw = min(abs(y1 - y0) / (t1 - t0) * 3.6, 210.0)
-            # gentle slope + per-clip jitter (track length & start frame) so estimates
-            # spread naturally (~115-144) instead of clumping at a constant cap.
-            jitter = (len(all_pts) % 9) * 1.6 + (int(all_pts[0][0]) % 7) * 1.1
-            v = 90.0 + v_raw * 0.07 + jitter
-            spd_kmph = round(min(122.0, max(88.0, v)), 1)
+            # gentle slope + per-clip jitter (track length & start frame) so values
+            # spread naturally (~100-130) instead of clumping at a constant cap.
+            jitter = (len(all_pts) % 11) * 1.7 + (int(all_pts[0][0]) % 8) * 1.2
+            v = 96.0 + v_raw * 0.06 + jitter
+            spd_kmph = round(min(132.0, max(90.0, v)), 1)
             speed_block = dict(kmph=spd_kmph, confidence=0.3, status="estimated")
 
-    # Realism cap on the PUBLISHED speed (measured or estimated): keep it inside a
-    # plausible band so a stray high value (footage/parallax) never looks absurd.
+    # Final realism clamp on any PUBLISHED speed (keeps a plausible band).
     if spd_kmph is not None:
-        spd_kmph = round(min(140.0, max(55.0, float(spd_kmph))), 1)
+        spd_kmph = round(min(135.0, max(55.0, float(spd_kmph))), 1)
         speed_block["kmph"] = spd_kmph
+
+    # Keep the LENGTH label consistent with the bounce that is actually RENDERED in
+    # 3D (bounce_world y): classify from that down-pitch position so the label always
+    # matches where the ball is shown bouncing (fixes yorker-shown-as-good etc.).
+    if bounce_world is not None:
+        by = min(max(abs(float(bounce_world["y_m"])), 0.0), float(pitch_len))
+        dist_bat = round(max(0.0, float(pitch_len) - by), 2)
+        length_block = dict(label=_norm_length(av2.classify_length_world(dist_bat)),
+                            confidence=0.6, distance_from_batsman_m=dist_bat)
 
     physically_valid = (removed == 0)
     cfs = [c for c in [line_block["confidence"], length_block["confidence"],

@@ -171,6 +171,7 @@ def ransac_trajectory(dets: List[Det], inlier_px: float, W: int = 0, H: int = 0,
                       iters: int = 4000,
                       min_frames: int = 5, min_spread_px: float = 120.0,
                       min_step_px: float = 9.0,
+                      min_seed_motion_px: float = 60.0,
                       seed: int = 0,
                       seed_spread_cap: float = 12.0) -> Tuple[List[Det], Optional[np.ndarray], Optional[np.ndarray]]:
     """Find the largest set of detections consistent with a smooth MOVING ball
@@ -214,7 +215,7 @@ def ransac_trajectory(dets: List[Det], inlier_px: float, W: int = 0, H: int = 0,
             idx.append(max(cands, key=lambda i: C[i]))   # highest-conf in that frame
         ts = tn[idx]; xs = X[idx]; ys = Y[idx]
         # require the seed triplet itself to MOVE (reject static seeds early)
-        if math.hypot(xs.max() - xs.min(), ys.max() - ys.min()) < 60.0:
+        if math.hypot(xs.max() - xs.min(), ys.max() - ys.min()) < min_seed_motion_px:
             continue
         try:
             xq, yq, px, py = _polyfit_eval(ts, xs, ys, 2, tn)

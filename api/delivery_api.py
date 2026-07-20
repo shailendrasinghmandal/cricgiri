@@ -34,7 +34,7 @@ from fastapi import (FastAPI, File, Form, Header, HTTPException, UploadFile,
                      WebSocket, WebSocketDisconnect)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -56,6 +56,7 @@ except Exception:
 logger = logging.getLogger("cricgiri.delivery_api")
 ALLOWED_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 OUTPUT_DIR = ROOT / "outputs" / "delivery_api"
+UI_OUTPUT_DIR = ROOT / "outputs" / "delivery_api_ui"
 
 # The ball/stump YOLO models are shared singletons and torch inference is NOT thread-safe;
 # run_in_threadpool would otherwise run requests concurrently on the same model. Serialise
@@ -89,7 +90,156 @@ def _warm() -> None:
 
 @app.get("/")
 def root() -> RedirectResponse:
-    return RedirectResponse("/docs")
+    return RedirectResponse("/ui")
+
+
+def _engine_status() -> dict:
+    return {
+        "models": engine._ENGINE.get("model_paths") or [],
+        "device": engine._ENGINE.get("device"),
+        "conf": engine.CONF,
+        "imgsz": engine.IMGSZ,
+        "pitch_length_m": engine.PITCH_LEN,
+        "engine": "api.delivery_api -> scripts.run_demo_testing.analyze_video",
+    }
+
+
+def _ui_page(message: str = "", download_name: Optional[str] = None, preview: str = "") -> HTMLResponse:
+    status = _engine_status()
+    models = ", ".join(status["models"]) if status["models"] else "loading on first request"
+    msg = f"<p class='ok'>{message}</p>" if message else ""
+    link = (
+        f"<p>"
+        f"<a class='btn' href='/ui/download/{download_name}' download>Download JSON</a> "
+        f"<a class='btn secondary' href='/ui/view/{download_name}' target='_blank'>Open JSON</a>"
+        f"</p>"
+        f"<p class='path'>Saved at: {UI_OUTPUT_DIR / download_name}</p>"
+        if download_name
+        else ""
+    )
+    pre = f"<pre>{preview[:12000]}</pre>" if preview else ""
+    return HTMLResponse(f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>CricGiri Local 8000 API</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; background:#101820; color:#f7f9fb; margin:32px; }}
+    main {{ max-width: 900px; margin:auto; }}
+    .box {{ background:#172330; border:1px solid #2d4055; border-radius:8px; padding:18px; margin:14px 0; }}
+    label {{ display:block; font-weight:700; margin:14px 0 6px; }}
+    input {{ font-size:16px; }}
+    input[type=number] {{ padding:8px; width:120px; }}
+    button,.btn {{ background:#ffd34d; color:#111; border:0; padding:11px 16px; border-radius:6px; font-weight:800; text-decoration:none; cursor:pointer; }}
+    .secondary {{ background:#9fd3ff; }}
+    .ok {{ color:#9dffb4; font-weight:800; }}
+    .path {{ color:#c7d3df; font-size:14px; }}
+    pre {{ background:#06101d; padding:14px; border-radius:8px; overflow:auto; max-height:420px; white-space:pre-wrap; }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>CricGiri Local 8000 Upload</h1>
+  <div class="box">
+    <b>Same later 8000 engine:</b> {status["engine"]}<br>
+    <b>Models:</b> {models}<br>
+    <b>Config:</b> conf={status["conf"]}, imgsz={status["imgsz"]}, pitch_length_m={status["pitch_length_m"]}
+  </div>
+  <div class="box">
+    <form method="post" action="/ui/upload" enctype="multipart/form-data">
+      <label>Video</label>
+      <input type="file" name="video" accept=".mp4,.mov,.avi,.mkv,.webm" required>
+      <label>Pitch length in metres &nbsp;<span style="font-weight:400;color:#9fd3ff">(changes the speed — default full pitch 20.12 m)</span></label>
+      <input type="number" name="pitch_length" value="20.12" step="0.01" min="1" max="30">
+      <p style="color:#c7d3df;font-size:13px;margin:4px 0 0">Speed scales with this: a shorter pitch → lower km/h; longer → higher. Bounce &amp; length also shift.</p>
+      <p><button type="submit">Run 8000 Engine</button></p>
+    </form>
+  </div>
+  {msg}
+  {link}
+  {pre}
+</main>
+</body>
+</html>""")
+
+
+@app.get("/ui", response_class=HTMLResponse)
+def upload_ui() -> HTMLResponse:
+    return _ui_page()
+
+
+@app.post("/ui/upload", response_class=HTMLResponse)
+async def upload_ui_run(
+    video: UploadFile = File(..., description="Cricket delivery video"),
+    pitch_length: float = Form(20.12, description="Real pitch length in metres"),
+) -> HTMLResponse:
+    ext = Path(video.filename or "").suffix.lower()
+    if ext not in ALLOWED_EXT:
+        raise HTTPException(400, f"Unsupported file type '{ext}'. Allowed: {sorted(ALLOWED_EXT)}")
+    data = await video.read()
+    if not data:
+        raise HTTPException(400, "Empty upload")
+    if len(data) > MAX_MB * 1024 * 1024:
+        raise HTTPException(413, f"File too large (> {MAX_MB} MB)")
+
+    up_dir = ROOT / "uploads"
+    up_dir.mkdir(parents=True, exist_ok=True)
+    UI_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    safe_stem = Path(video.filename or "upload").stem
+    result_id = f"{safe_stem}_{uuid.uuid4().hex[:8]}"
+    tmp = up_dir / f"ui_{result_id}{ext}"
+    out_json = UI_OUTPUT_DIR / f"{result_id}.json"
+    tmp.write_bytes(data)
+    t0 = time.perf_counter()
+
+    def _run() -> dict:
+        with _INFER_LOCK:
+            result = engine.analyze_video(
+                str(tmp),
+                pitch_length=float(pitch_length),
+                work_id=f"ui_{result_id}",
+                cleanup=True,
+            )
+            result["result_id"] = result_id
+            result["uploaded_filename"] = video.filename
+            return result
+
+    try:
+        result = await run_in_threadpool(_run)
+    except Exception as exc:                                   # noqa: BLE001
+        logger.exception("UI analysis failed for %s", video.filename)
+        raise HTTPException(500, f"analysis failed: {type(exc).__name__}: {exc}")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    result["processing_sec"] = round(time.perf_counter() - t0, 1)
+    import json as _json
+    pretty = _json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    out_json.write_text(pretty, encoding="utf-8")
+    return _ui_page(
+        message=f"Done. Saved JSON: {out_json.name}",
+        download_name=out_json.name,
+        preview=pretty,
+    )
+
+
+@app.get("/ui/download/{filename}")
+def upload_ui_download(filename: str) -> FileResponse:
+    safe = Path(filename).name
+    path = UI_OUTPUT_DIR / safe
+    if not path.exists() or path.suffix.lower() != ".json":
+        raise HTTPException(404, "JSON result not found")
+    return FileResponse(path, media_type="application/json", filename=safe)
+
+
+@app.get("/ui/view/{filename}")
+def upload_ui_view(filename: str) -> Response:
+    safe = Path(filename).name
+    path = UI_OUTPUT_DIR / safe
+    if not path.exists() or path.suffix.lower() != ".json":
+        raise HTTPException(404, "JSON result not found")
+    return Response(path.read_text(encoding="utf-8"), media_type="application/json")
 
 
 @app.get("/health")

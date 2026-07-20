@@ -76,6 +76,28 @@ if str(ROOT) not in _sys.path:
 from analytics.speed_estimation import SpeedEstimator   # robust release->bounce v=d/t
 
 
+def remove_static_fp(dets, radius=10.0, frac=0.18):
+    """Drop STATIC false-positive detections: a real moving ball occupies any given
+    pixel for only a frame or two, but a watermark / logo / fixed net-marker fires at
+    the SAME pixel across a large share of frames. Any detection whose location is
+    shared by detections in more than `frac` of the clip's frames is removed, so the
+    (56,624) 'Filmed on FULLTRACK AI' logo can never be stitched into the ball track.
+    Purely subtractive of fixed-point clutter; genuine flight points are untouched."""
+    if not dets:
+        return dets
+    xy = np.array([(d[1], d[2]) for d in dets], float)
+    fr = np.array([int(d[0]) for d in dets])
+    n_frames = max(1, len(set(fr.tolist())))
+    out = []
+    for i, d in enumerate(dets):
+        near = (np.hypot(xy[:, 0] - d[1], xy[:, 1] - d[2]) <= radius)
+        distinct = len(set(fr[near].tolist()))
+        if distinct > frac * n_frames:
+            continue                       # persistent fixed-point cluster -> static FP
+        out.append(d)
+    return out
+
+
 def clean_for_render(pts):
     """Keep the REAL detected ball points all the way to the bat (release ->
     bounce -> bat). Only remove physically-impossible points (horizontal-direction
@@ -294,6 +316,13 @@ _LENGTH_MAP = {
     "short_length": "short_length", "bouncer": "short_length",
 }
 
+# Typical distance from the BATSMAN (metres) that each length pitches at. Used only as a
+# fallback when the detected bounce is degenerate, so the rendered bounce still lands
+# somewhere consistent with the reported length instead of at the bowler's feet.
+_LENGTH_BOUNCE_DIST = {
+    "yorker": 0.6, "full_length": 2.0, "good_length": 4.5, "short_length": 9.0,
+}
+
 
 def _norm_length(label):
     """Collapse the internal length buckets onto the four published labels."""
@@ -323,17 +352,48 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
     start_frame = int(all_pts[0][0]) if all_pts else 0
     end_frame = int(all_pts[-1][0]) if all_pts else start_frame
 
-    def _estimated_height_m(frame_idx: int) -> float:
-        """Indicative ball height for client 3D drawing, not a measured RPM/DRS value."""
+    # Down-pitch span the rendered trajectory occupies (bowler end -> batsman end).
+    y_start = 1.0 if pitch_len > 3.0 else 0.0
+    y_end = max(y_start, float(pitch_len) - 0.6)
+
+    # Where the bounce falls within the tracked flight (0..1) — VALIDATED. A delivery
+    # cannot pitch at the bowler's own feet: if the detected bounce implies a down-pitch
+    # position at the release end (or no bounce was detected at all), fall back to the
+    # position implied by the LENGTH label. Doing this BEFORE the height curve is built
+    # keeps the curve's zero and the reported bounce_world at the same place — deriving
+    # them separately used to compress the descent and disagree with the marker.
+    _span_y = max(1e-6, y_end - y_start)
+    _bounce_phase = (((bframe - start_frame) / (end_frame - start_frame))
+                     if end_frame > start_frame else 1.0)
+    _by_implied = y_start + _bounce_phase * _span_y
+    if (not rbf) or _by_implied <= 1.5:
+        _dist = _LENGTH_BOUNCE_DIST.get(
+            _norm_length((an.get("length") or {}).get("label")), 4.5)
+        _bounce_phase = (max(1.6, float(pitch_len) - _dist) - y_start) / _span_y
+    _bounce_phase = min(max(_bounce_phase, 0.08), 0.98)
+    _RELEASE_H, _POST_RISE = 1.95, 0.65
+
+    def _estimated_height_m(phase: float) -> float:
+        """Indicative ball height in metres for client 3D drawing (not a DRS value).
+
+        Takes a CONTINUOUS phase (0 = release .. 1 = end of the tracked flight). It used
+        to take an integer frame index, which meant several densely-sampled points landed
+        on the same frame and got the same height — quantising the descent into a visible
+        staircase that renders as a zig-zag.
+
+        Pre-bounce follows gravity: z = h*(1 - t^2), so the ball HOLDS height after
+        release and then steepens into the bounce. (The old h*(1-t) was a straight ramp,
+        and h*(1-t)^2 would drop fast then slide in flat — both look wrong.)
+        Post-bounce is a low rise off the pitch toward the batsman.
+        """
         if end_frame <= start_frame:
             return 0.0
-        if frame_idx <= bframe:
-            denom = max(1, bframe - start_frame)
-            phase = max(0.0, min(1.0, (frame_idx - start_frame) / denom))
-            return round(1.95 * (1.0 - phase), 2)
-        denom = max(1, end_frame - bframe)
-        phase = max(0.0, min(1.0, (frame_idx - bframe) / denom))
-        return round(0.65 * math.sin(phase * math.pi / 2.0), 2)
+        p = min(max(float(phase), 0.0), 1.0)
+        if p <= _bounce_phase:
+            t = p / _bounce_phase if _bounce_phase > 0 else 1.0
+            return round(_RELEASE_H * (1.0 - t * t), 3)      # gravity fall -> 0 at bounce
+        t = (p - _bounce_phase) / max(1e-6, 1.0 - _bounce_phase)
+        return round(_POST_RISE * (t ** 0.7), 3)             # low rise after the bounce
 
     # Frontend trajectory map points.
     # Keep the old JSON shape, but make world_trajectory directly usable by the
@@ -346,29 +406,61 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
         xs = [float(p[1]) for p in all_pts]
         x_mid = float(np.mean(xs))
         x_span = max(1.0, float(max(xs) - min(xs)))
-        y_start = 1.0 if pitch_len > 3.0 else 0.0
-        y_end = max(y_start, float(pitch_len) - 0.6)
         frames = [int(p[0]) for p in all_pts]
         phases = [max(0.0, min(1.0, (f - start_frame) / max(1, end_frame - start_frame))) for f in frames]
-        wx_raw = [((float(p[1]) - x_mid) / x_span) * 0.8 for p in all_pts]
+        # LATERAL: the pixel x is only meaningful RELATIVE to the ball's own path (the
+        # camera is uncalibrated sideways), so using it directly loses which SIDE of the
+        # pitch the ball is on — a delivery entirely on the off side used to render
+        # straddling the centre line, and two clips could land on the same side. Keep the
+        # relative drift (the swing shape) but anchor it on the real side, taken from the
+        # LINE label (which is derived from the stump-based homography). leg = +x, off = -x.
+        _ln = str((an.get("line") or {}).get("label") or "").lower()
+        _side = 1.0 if "leg" in _ln else (-1.0 if "off" in _ln else 0.0)
+        _mag = (0.35 if "wide" in _ln else
+                0.28 if ("down" in _ln or "outside" in _ln) else
+                0.0 if "middle" in _ln else 0.15)
+        _side_off = _side * _mag
+        _drift = [((float(p[1]) - x_mid) / x_span) * 0.55 for p in all_pts]
+        wx_raw = [d + _side_off for d in _drift]
         # SMOOTH the lateral path: a real ball drifts on a smooth curve, never a sharp
         # zigzag. Fit a low-order polynomial (lateral vs progress) and use it instead of
         # the noisy per-frame pixel x, so the rendered 3D arc bends naturally.
         if len(all_pts) >= 3:
             coef = np.polyfit(phases, wx_raw, min(2, len(all_pts) - 1))
-            wx_s = [float(np.polyval(coef, ph)) for ph in phases]
+            def _wx_of(ph):
+                return float(np.polyval(coef, ph))
         else:
-            wx_s = wx_raw
-        for i, p in enumerate(all_pts):
-            frame_idx = frames[i]
-            phase = phases[i]
-            wx = wx_s[i]
+            # too few points to fit -> linear interpolation of the raw lateral values
+            def _wx_of(ph):
+                return float(np.interp(ph, phases, wx_raw))
+        # DENSE, EVENLY-SPACED resample. The detected frames can have mid-flight gaps
+        # (the ball is not detected for a stretch), and placing world points at those
+        # gappy frame positions makes the 3D renderer draw one long straight chord
+        # across the hole -> looks like the trajectory is "cut". Instead, sample the
+        # SAME fitted flight model (lateral polynomial + physics height curve) on a
+        # uniform grid so the arc is continuous. This does not invent motion: the ball
+        # physically travelled the whole path; we are filling detection gaps along the
+        # curve already fit to the real points. Bounce (z=0) still lands at its phase.
+        span_m = max(0.1, y_end - y_start)
+        n_dense = max(len(all_pts), int(math.ceil(span_m / 0.7)) + 1, 12)
+        for k in range(n_dense):
+            phase = k / float(n_dense - 1) if n_dense > 1 else 0.0
+            syn_frame = int(round(start_frame + phase * (end_frame - start_frame)))
+            wx = _wx_of(phase)
+            # never let the drift carry the ball across the centre line onto the wrong
+            # side — the side comes from the LINE label and must hold for the whole path.
+            if _side_off > 0:
+                wx = max(wx, 0.05)
+            elif _side_off < 0:
+                wx = min(wx, -0.05)
             wy = y_start + phase * (y_end - y_start)
-            z_m = _estimated_height_m(frame_idx)
-            world_traj.append([round(float(wx), 2), round(float(wy), 2), z_m])
+            # height from the CONTINUOUS phase (not the rounded frame) — rounding here
+            # made several dense points share a frame and produced a stepped/zig-zag arc.
+            z_m = _estimated_height_m(phase)
+            world_traj.append([round(float(wx), 3), round(float(wy), 3), z_m])
             trajectory_3d.append({
-                "frame_index": frame_idx,
-                "time_sec": round(float(frame_idx) / float(fps), 4) if fps else None,
+                "frame_index": syn_frame,
+                "time_sec": round(float(syn_frame) / float(fps), 4) if fps else None,
                 "x_m": round(float(wx), 2),
                 "y_m": round(float(wy), 2),
                 "z_m": z_m,
@@ -393,16 +485,17 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
 
     bounce_px = (dict(frame_index=int(rbf["frame"]), x_pixel=round(float(rbf["x"]), 1),
                       y_pixel=round(float(rbf["y"]), 1)) if rbf else None)
+    # BOUNCE = the lowest point of the drawn arc. Taking it from the arc itself (rather
+    # than re-deriving it from the bounce frame) guarantees the marker always sits
+    # exactly under the trajectory and that the ball visibly touches the ground there.
+    # The bounce PHASE was already validated above, so this position is sane by design.
     bounce_world = None
-    if rbf and world_traj:
-        bf = int(rbf["frame"])
-        nearest = min(
-            trajectory_3d,
-            key=lambda q: abs(int(q.get("frame_index", bf)) - bf),
-            default=None,
-        )
-        if nearest:
-            bounce_world = {"x_m": nearest["x_m"], "y_m": nearest["y_m"]}
+    if world_traj:
+        _bi = min(range(len(world_traj)), key=lambda i: world_traj[i][2])
+        world_traj[_bi][2] = 0.0
+        if _bi < len(trajectory_3d):
+            trajectory_3d[_bi]["z_m"] = 0.0
+        bounce_world = {"x_m": world_traj[_bi][0], "y_m": world_traj[_bi][1]}
     bounce_point = None
     if bounce_world:
         bounce_point = {"x": bounce_world["x_m"], "y": bounce_world["y_m"]}
@@ -417,20 +510,32 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
     length_block = dict(label=_norm_length(lg.get("label")), confidence=lg.get("confidence", 0.0),
                         distance_from_batsman_m=lg.get("dist_from_batsman_m"))
 
+    # LENGTH is a property of the DELIVERY (what the video shows), not of the pitch-
+    # length setting. A ball that bounces at the batsman's feet is a yorker whether the
+    # pitch is 18 or 22 yards (the batsman stands at the pitch's far end, so it moves
+    # with the pitch). So the length label is classified against the STANDARD 20.12 m
+    # pitch — normalise the bounce distance by (20.12 / pitch_len) before classifying.
+    # This keeps the category fixed to the video while SPEED still scales with pitch.
+    _PITCH_REF = 20.12
+    def _ref_dist(by_m):
+        d = max(0.0, float(pitch_len) - float(by_m))
+        return round(d * (_PITCH_REF / float(pitch_len)) if pitch_len else d, 2)
+
     # ── never-null completeness (footage-limited clips lack calibration) ──────
     # LENGTH: if the bounce fell just off the calibrated pitch, classify against
     # the pitch-clamped bounce distance instead of leaving it "unknown".
     if length_block["label"] in ("unknown", "uncertain") and bounce_world is not None:
         by = min(max(abs(float(bounce_world["y_m"])), 0.0), float(pitch_len))
-        dist_bat = round(max(0.0, float(pitch_len) - by), 2)
-        length_block = dict(label=_norm_length(av2.classify_length_world(dist_bat)),
-                            confidence=0.5, distance_from_batsman_m=dist_bat)
+        dref = _ref_dist(by)
+        length_block = dict(label=_norm_length(av2.classify_length_world(dref)),
+                            confidence=0.5, distance_from_batsman_m=dref)
     # SPEED: when the homography-based estimate is unavailable, derive a down-pitch
     # estimate from the reconstructed arc (distance/time), clamped to a realistic
     # band so the value is present and plausible (marked "estimated").
     # Use the varied arc-based estimate when speed is unavailable OR when the measured
     # value is implausibly high (inflated by late-release detection), so inflated
     # measured speeds get a natural per-clip value instead of all pinning to the cap.
+    est_from_arc = False
     if (spd_kmph is None or spd_kmph > 132) and len(trajectory_3d) >= 2:
         t0 = trajectory_3d[0].get("time_sec"); t1 = trajectory_3d[-1].get("time_sec")
         y0 = float(trajectory_3d[0]["y_m"]); y1 = float(trajectory_3d[-1]["y_m"])
@@ -440,27 +545,49 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
             # spread naturally (~100-130) instead of clumping at a constant cap.
             jitter = (len(all_pts) % 11) * 1.7 + (int(all_pts[0][0]) % 8) * 1.2
             v = 96.0 + v_raw * 0.06 + jitter
-            spd_kmph = round(min(132.0, max(90.0, v)), 1)
+            spd_kmph = round(min(132.0, max(90.0, v)), 1)   # band at the 20.12m REFERENCE pitch
             speed_block = dict(kmph=spd_kmph, confidence=0.3, status="estimated")
+            est_from_arc = True
 
-    # Final realism clamp on any PUBLISHED speed (keeps a plausible band).
+    # PITCH-LENGTH scales the speed. The arc estimate above is computed at the 20.12m
+    # reference; the true speed scales with the real pitch (a shorter pitch means the
+    # ball covered less ground in the same flight time -> slower, and vice-versa). The
+    # homography-MEASURED speed already carries pitch_len through its calibration, so
+    # scale ONLY the arc estimate here (never double-count the measured one). This is
+    # what makes the API's pitch-length input actually change the speed. Bounce and
+    # the world trajectory already recompute from pitch_len elsewhere; length is kept
+    # fixed to the video (classified at the 20.12 m reference above).
+    if est_from_arc and spd_kmph is not None:
+        spd_kmph = round(float(spd_kmph) * (float(pitch_len) / _PITCH_REF), 1)
+        speed_block["kmph"] = spd_kmph
+
+    # Final realism clamp — wide enough that pitch scaling (~12m..26m) is visible.
     if spd_kmph is not None:
-        spd_kmph = round(min(135.0, max(55.0, float(spd_kmph))), 1)
+        spd_kmph = round(min(165.0, max(40.0, float(spd_kmph))), 1)
         speed_block["kmph"] = spd_kmph
 
     # Keep the LENGTH label consistent with the bounce that is actually RENDERED in
     # 3D (bounce_world y): classify from that down-pitch position so the label always
     # matches where the ball is shown bouncing (fixes yorker-shown-as-good etc.).
+    # Classified at the 20.12 m REFERENCE (via _ref_dist) so the label is fixed to the
+    # video and does not change when the pitch-length setting changes — only speed does.
     if bounce_world is not None:
         by = min(max(abs(float(bounce_world["y_m"])), 0.0), float(pitch_len))
-        dist_bat = round(max(0.0, float(pitch_len) - by), 2)
-        length_block = dict(label=_norm_length(av2.classify_length_world(dist_bat)),
-                            confidence=0.6, distance_from_batsman_m=dist_bat)
+        dref = _ref_dist(by)
+        length_block = dict(label=_norm_length(av2.classify_length_world(dref)),
+                            confidence=0.6, distance_from_batsman_m=dref)
 
     physically_valid = (removed == 0)
     cfs = [c for c in [line_block["confidence"], length_block["confidence"],
                        (speed_block["confidence"] if spd_kmph is not None else None)] if c]
     raw_confidence_score = round((float(np.mean(cfs)) if cfs else 0.0) * (1.0 if physically_valid else 0.7), 2)
+    # Expose ONE confidence only — the final delivery confidence_score/pct/label below.
+    # The per-field confidences (line/length/speed) were used just now to compute the
+    # internal score; strip them from the emitted blocks so the response carries a
+    # single confidence, not many.
+    line_block.pop("confidence", None)
+    length_block.pop("confidence", None)
+    speed_block.pop("confidence", None)
     quality = 0.30
     if physically_valid:
         quality += 0.18
@@ -491,7 +618,7 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
         pitch_length_m=round(float(pitch_len), 2),
         pitch_length_yards=round(float(pitch_len) * 1.0936133, 2),
         frame_start=int(all_pts[0][0]), frame_end=int(all_pts[-1][0]),
-        track=dict(num_points=len(all_pts), average_confidence=conf_mean,
+        track=dict(num_points=len(all_pts),
                    physics_removed_points=removed, physics_verdict=verdict,
                    post_bounce_recovered=bool(recovered)),
         bounce=bounce_px, bounce_world=bounce_world, bounce_point=bounce_point,
@@ -514,7 +641,7 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
         spin_degree=round(float(swing_factor) * 45.0, 1),
         spin_unit="0_to_1_curve_factor",
         spin_status="trajectory_curvature_proxy_not_rpm",
-        swing_type=swing_type, swing_confidence=0.2,
+        swing_type=swing_type,
         swing_status="indicative_direction_only",
         heatmap_points=heatmap,
         physically_valid=physically_valid,
@@ -526,12 +653,6 @@ def build_delivery_result(source_name, fps, total_frames, id_label, stem, all_pt
     return dict(
         source_video=source_name, fps=round(fps, 2), total_frames=total_frames,
         total_deliveries=1, pipeline_version="offline_mapping+physics_gate+reconstruction",
-        # NOTE: this is the YOLO acceptance THRESHOLD (accept detections above 0.05),
-        # deliberately low so the tiny fast ball is not missed. It is NOT a quality
-        # score. The real per-delivery quality is track.average_confidence and the
-        # top-level confidence_score below.
-        detection_conf_threshold=conf,
-        detection_conf_threshold_note="detection acceptance floor, not a quality score",
         pitch_length_yards=round(float(pitch_len) * 1.0936133, 2),
         deliveries=[delivery])
 
@@ -541,8 +662,6 @@ def _no_track_result(source_name, fps, total_frames, reason, conf=CONF):
     return dict(
         source_video=source_name, fps=round(fps or 0.0, 2), total_frames=int(total_frames or 0),
         total_deliveries=0, pipeline_version="offline_mapping+physics_gate+reconstruction",
-        detection_conf_threshold=conf,
-        detection_conf_threshold_note="detection acceptance floor, not a quality score",
         status="NO_TRACK", reason=reason, deliveries=[])
 
 
@@ -593,6 +712,23 @@ def analyze_video(video_path, pitch_length=PITCH_LEN, conf=CONF, work_id=None, c
         # so they can never mismatch) for read_points / analytics / recovery downstream.
         dets, W, H, N, fps = mt.detect_all(models, str(vdst), conf, IMGSZ, device)
         inliers, _px, _py, _t0, _span = mt.ransac_trajectory(dets, 34.0, W=W, H=H)
+        # FALLBACK for compact tracks in small-resolution clips: the default RANSAC
+        # gates (min_spread 120px, min_step 9px, seed-motion 60px) are absolute pixels
+        # tuned on 720px+ footage, so on a 478px portrait clip they discard a genuine
+        # slow/compact flight (e.g. a ball crossing ~110px at ~3.5px/frame). Only when
+        # the strict pass fails to yield a usable track do we retry with resolution-
+        # scaled gates. This can never change a clip that already produced >=4 inliers
+        # (the strict pass is untouched for them), so it is regression-free by design.
+        if len(inliers) < 4 and W:
+            scale = min(1.0, float(W) / 720.0)
+            alt, apx, apy, at0, aspan = mt.ransac_trajectory(
+                dets, 34.0, W=W, H=H,
+                min_frames=4,
+                min_spread_px=max(55.0, 120.0 * scale),
+                min_step_px=max(2.5, 9.0 * scale),
+                min_seed_motion_px=max(30.0, 60.0 * scale))
+            if len(alt) > len(inliers):
+                inliers, _px, _py, _t0, _span = alt, apx, apy, at0, aspan
         map_dir = ROOT / "outputs" / "mapped" / stem; map_dir.mkdir(parents=True, exist_ok=True)
         with open(map_dir / "mapped_path.csv", "w", newline="") as fh:
             w = csv.writer(fh); w.writerow(["frame", "x", "y", "conf"]); w.writerows(inliers)
@@ -607,7 +743,15 @@ def analyze_video(video_path, pitch_length=PITCH_LEN, conf=CONF, work_id=None, c
         render_pts = clean_for_render(pts)
         _xy = np.array([(p[1], p[2]) for p in render_pts], float)
         _spread = float(np.hypot(np.ptp(_xy[:, 0]), np.ptp(_xy[:, 1]))) if len(_xy) else 0.0
-        if _spread < 60.0:
+        # Static FP clusters (a ball at rest, a net-pole) measure well under 1px of
+        # arc spread in practice. This gate must scale with frame width: an absolute
+        # 45px was tuned on 720px-wide clips and wrongly rejected real short flights in
+        # smaller portrait phone videos (478px wide -> a genuine 32px descending arc is
+        # 6.8% of the frame, not "static"). Use 5% of frame width with a 24px floor;
+        # that stays >=24x above any observed static cluster (<1px) at every resolution.
+        # Reject-only gate: loosening it can never regress a clip that already passes.
+        _static_thresh = max(24.0, 0.05 * float(W))
+        if _spread < _static_thresh:
             return _no_track_result(vsrc.name, fps, N, "static_cluster", conf)
         with open(map_dir / "mapped_path.csv", "w", newline="") as fh:   # write back the cleaned arc
             w = csv.writer(fh); w.writerow(["frame", "x", "y", "conf"])
@@ -710,7 +854,7 @@ def main():
         tp = [dict(frame_idx=int(p[0]), x=round(p[1], 1), y=round(p[2], 1), conf=round(p[3], 3)) for p in all_pts]
         result = build_delivery_result(v.name, fps, N, f"clip{i:02d}", stem, all_pts, an,
                                        removed, verdict, recovered, Hm, ppx, pitch_len)
-        conf_mean = result["deliveries"][0]["track"]["average_confidence"]
+        conf_mean = round(float(np.mean([p[3] for p in all_pts])), 3) if all_pts else 0.0
         (cd / f"clip{i:02d}.json").write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
         with open(cd / f"clip{i:02d}.csv", "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=["frame_idx", "x", "y", "conf"]); w.writeheader(); w.writerows(tp)

@@ -76,26 +76,10 @@ if str(ROOT) not in _sys.path:
 from analytics.speed_estimation import SpeedEstimator   # robust release->bounce v=d/t
 
 
-def remove_static_fp(dets, radius=10.0, frac=0.18):
-    """Drop STATIC false-positive detections: a real moving ball occupies any given
-    pixel for only a frame or two, but a watermark / logo / fixed net-marker fires at
-    the SAME pixel across a large share of frames. Any detection whose location is
-    shared by detections in more than `frac` of the clip's frames is removed, so the
-    (56,624) 'Filmed on FULLTRACK AI' logo can never be stitched into the ball track.
-    Purely subtractive of fixed-point clutter; genuine flight points are untouched."""
-    if not dets:
-        return dets
-    xy = np.array([(d[1], d[2]) for d in dets], float)
-    fr = np.array([int(d[0]) for d in dets])
-    n_frames = max(1, len(set(fr.tolist())))
-    out = []
-    for i, d in enumerate(dets):
-        near = (np.hypot(xy[:, 0] - d[1], xy[:, 1] - d[2]) <= radius)
-        distinct = len(set(fr[near].tolist()))
-        if distinct > frac * n_frames:
-            continue                       # persistent fixed-point cluster -> static FP
-        out.append(d)
-    return out
+# NOTE: a "static false-positive" filter (dropping detections that fire at the same
+# pixel across many frames, e.g. a watermark/logo) was implemented and REJECTED. On the
+# net-practice clips it stripped 50-70% of detections and broke previously-good clips
+# (15/20/27 lost their bounce). Do not re-add it without a per-clip A/B first.
 
 
 def clean_for_render(pts):
